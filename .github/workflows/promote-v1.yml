@@ -1,0 +1,49 @@
+name: Promote v1.0 release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/promote-v1.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote v0.1.0 to v1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # If already promoted, make the workflow idempotent.
+          if gh api "repos/$REPO/releases/tags/v1.0" >/dev/null 2>&1; then
+            echo "v1.0 release already exists. Nothing to do."
+            exit 0
+          fi
+
+          release_id="$(gh api "repos/$REPO/releases/tags/v0.1.0" --jq '.id')"
+          old_tag_sha="$(gh api "repos/$REPO/git/ref/tags/v0.1.0" --jq '.object.sha')"
+
+          # Create the stable v1.0 tag at the exact same object as v0.1.0.
+          if ! gh api "repos/$REPO/git/ref/tags/v1.0" >/dev/null 2>&1; then
+            gh api --method POST "repos/$REPO/git/refs" \
+              -f ref='refs/tags/v1.0' \
+              -f sha="$old_tag_sha"
+          fi
+
+          # Keep all existing release assets/body, change only version/name and release status.
+          gh api --method PATCH "repos/$REPO/releases/$release_id" \
+            -f tag_name='v1.0' \
+            -f name='v1.0' \
+            -F prerelease=false \
+            -F draft=false
+
+          # Remove the obsolete prerelease tag once the release points to v1.0.
+          gh api --method DELETE "repos/$REPO/git/refs/tags/v0.1.0"
+
+          echo "Promoted v0.1.0 prerelease to stable v1.0 release."
