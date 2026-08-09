@@ -1065,6 +1065,12 @@ void OpenXRManager::SetSession(XrSession session)
   m_session = session;
   m_tabletop_runtime_enabled.store(g_ActiveConfig.vr_tabletop_mode, std::memory_order_release);
   m_tabletop_toggle_right_stick_was_down = false;
+  // A fresh XR session gets a fresh canonical Animal Crossing tabletop basis. Later runtime camera
+  // toggles intentionally keep this basis so transient Camera2 pitch/roll cannot tilt the board.
+  m_ac_tabletop_stable_basis_valid = false;
+  m_ac_tabletop_camera_anchor_valid = false;
+  m_ac_tabletop_transition_active = false;
+  m_tabletop_reanchor_requested.store(false, std::memory_order_release);
 
   if (m_session == XR_NULL_HANDLE)
   {
@@ -3940,9 +3946,33 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
 
   if (!m_ac_tabletop_camera_anchor_valid)
   {
-    m_ac_tabletop_anchor_eye = eye;
     m_ac_tabletop_anchor_center = center;
-    m_ac_tabletop_anchor_up = up;
+    if (m_ac_tabletop_stable_basis_valid)
+    {
+      // Re-entering tabletop after the classic VR camera (or recovering after a temporary Camera2
+      // invalidation) must reuse the original stable camera basis. Only recenter the anchor at the
+      // current game position; do not adopt the live eye/up vectors because dialogue and scripted
+      // cameras can be pitched/rolled/zoomed at the exact frame the user switches back.
+      for (size_t axis = 0; axis < 3; ++axis)
+      {
+        m_ac_tabletop_anchor_eye[axis] =
+            center[axis] + m_ac_tabletop_stable_eye_from_center[axis];
+      }
+      m_ac_tabletop_anchor_up = m_ac_tabletop_stable_up;
+    }
+    else
+    {
+      // First stable tabletop capture for this XR session. Freeze its orientation and eye distance
+      // as the canonical basis used by every later re-anchor.
+      m_ac_tabletop_anchor_eye = eye;
+      m_ac_tabletop_anchor_up = up;
+      for (size_t axis = 0; axis < 3; ++axis)
+      {
+        m_ac_tabletop_stable_eye_from_center[axis] = eye[axis] - center[axis];
+      }
+      m_ac_tabletop_stable_up = up;
+      m_ac_tabletop_stable_basis_valid = true;
+    }
     m_ac_tabletop_anchor_block_x = current_block_x;
     m_ac_tabletop_anchor_block_z = current_block_z;
     m_ac_tabletop_anchor_local_x =

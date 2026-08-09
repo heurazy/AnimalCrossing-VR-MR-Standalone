@@ -754,6 +754,13 @@ private:
   mutable std::array<float, 3> m_ac_tabletop_anchor_eye{};
   mutable std::array<float, 3> m_ac_tabletop_anchor_center{};
   mutable std::array<float, 3> m_ac_tabletop_anchor_up{0.0f, 1.0f, 0.0f};
+  // Once a stable tabletop camera has been captured, keep its Camera2 orientation/distance as the
+  // canonical basis for the rest of the XR session. Re-anchoring after classic VR mode, dialogue
+  // cameras or scene transitions may update position, but must never inherit a transient game-camera
+  // pitch/roll/zoom or the physical tabletop will come back tilted.
+  mutable bool m_ac_tabletop_stable_basis_valid = false;
+  mutable std::array<float, 3> m_ac_tabletop_stable_eye_from_center{};
+  mutable std::array<float, 3> m_ac_tabletop_stable_up{0.0f, 1.0f, 0.0f};
   mutable int m_ac_tabletop_anchor_block_x = 0x7fffffff;
   mutable int m_ac_tabletop_anchor_block_z = 0x7fffffff;
   // Camera-center offset from the centre of the active acre. It stays constant while the
