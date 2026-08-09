@@ -1,0 +1,8 @@
+add_dolphin_test(VertexLoaderTest VertexLoaderTest.cpp)
+add_dolphin_test(CullingCodeFinderTest CullingCodeFinderTest.cpp)
+add_dolphin_test(MetroidElementClassifierTest MetroidElementClassifierTest.cpp)
+add_dolphin_test(TextureCacheBaseTest TextureCacheBaseTest.cpp)
+add_dolphin_test(VRFrameRegionTest VRFrameRegionTest.cpp)
+if(ENABLE_VR)
+  add_dolphin_test(OpenXRBindingWizardModelTest OpenXRBindingWizardModelTest.cpp)
+endif()

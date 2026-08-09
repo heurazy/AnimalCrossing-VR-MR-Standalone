@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="acvr_launcher_title">Animal Crossing VR</string>
+    <string name="acvr_launcher_subtitle">Your village, brought to life in VR.</string>
+    <string name="acvr_launcher_rom_label">Animal Crossing ROM</string>
+    <string name="acvr_launcher_no_rom">No ROM selected</string>
+    <string name="acvr_launcher_no_rom_description">Select an Animal Crossing USA Rev 0 ROM to get started.</string>
+    <string name="acvr_launcher_choose_rom">Select ROM</string>
+    <string name="acvr_launcher_change_rom">Change ROM</string>
+    <string name="acvr_launcher_play">Launch Animal Crossing VR</string>
+    <string name="acvr_launcher_starting">Launching…</string>
+    <string name="acvr_launcher_vr_settings">VR Settings</string>
+    <string name="acvr_launcher_selected_rom">Selected ROM</string>
+    <string name="acvr_launcher_rom_ready">Ready to play</string>
+    <string name="acvr_launcher_rom_checking">Checking ROM…</string>
+    <string name="acvr_launcher_rom_checking_description">Animal Crossing VR is checking the game version.</string>
+    <string name="acvr_launcher_rom_error_title">Incompatible ROM</string>
+    <string name="acvr_launcher_wrong_extension">“%1$s” is not a supported disc image format.</string>
+    <string name="acvr_launcher_invalid_rom">This ROM could not be read. Select a valid GameCube dump.</string>
+    <string name="acvr_launcher_wrong_game">This ROM is not Animal Crossing USA Rev 0. Detected ID: %1$s, revision: %2$d.</string>
+    <string name="acvr_launcher_unknown_game_id">unknown</string>
+    <string name="acvr_launcher_choose_another_rom">Select another ROM</string>
+    <string name="acvr_launcher_version">Version %1$s</string>
+</resources>

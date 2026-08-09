@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="acvr_accent">#58B887</color>
+    <color name="acvr_accent_light">#8DE0B3</color>
+    <color name="acvr_success">#8DE0B3</color>
+    <color name="acvr_text_secondary">#D2E4DA</color>
+    <color name="acvr_text_muted">#8EA39A</color>
+</resources>

@@ -1,0 +1,5 @@
+﻿Animal Crossing VR Quest profile
+Game ID: GAFE01 (USA Rev 0)
+Reference decomp: ACreTeam/ac-decomp GAFE01_00
+Runtime: DolphinXR Quest/OpenXR
+Target: Quest 3 / arm64-v8a
