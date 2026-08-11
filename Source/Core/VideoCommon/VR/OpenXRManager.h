@@ -398,6 +398,10 @@ public:
   // at roughly half strength so shrinking the diorama also shrinks the UI without making text tiny.
   float GetTabletopUIPhysicalScale() const;
 
+  // Effective physical distance for 2D HUD/menu planes. Animal Crossing's tabletop sits much
+  // closer than DolphinXR's generic 1.5 m screen default, so keep menus readable near the diorama.
+  float GetVirtualScreenDistanceMeters() const;
+
   // Runtime tabletop switch. The configured value is used when a VR session starts; the user can
   // then toggle between the classic game camera and the room-anchored tabletop with right-stick
   // click without rewriting the per-game INI.
@@ -761,6 +765,11 @@ private:
   mutable bool m_ac_tabletop_stable_basis_valid = false;
   mutable std::array<float, 3> m_ac_tabletop_stable_eye_from_center{};
   mutable std::array<float, 3> m_ac_tabletop_stable_up{0.0f, 1.0f, 0.0f};
+  // Stable bases are scene-local. Carrying the train/demo Camera2 basis into SCENE_FG can rotate
+  // the town tabletop and move the virtual-screen UI far away after the arrival transition.
+  mutable int m_ac_tabletop_scene_id = -1;
+  mutable int m_ac_tabletop_camera_invalid_frames = 0;
+  mutable XrTime m_ac_tabletop_next_camera_scan_time = 0;
   mutable int m_ac_tabletop_anchor_block_x = 0x7fffffff;
   mutable int m_ac_tabletop_anchor_block_z = 0x7fffffff;
   // Camera-center offset from the centre of the active acre. It stays constant while the

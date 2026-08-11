@@ -33,6 +33,15 @@ static constexpr int METROID_HUD_REFERENCE_CONTEXT_COMBAT = 1;
 static constexpr float METROID_COMBAT_HUD_REFERENCE_FAR_Z = -28.5f;
 static constexpr float METROID_COMBAT_HUD_REFERENCE_NEAR_Z = -18.0f;
 
+float GetVRScreenDistanceMeters()
+{
+#ifdef ENABLE_VR
+  if (VR::g_openxr)
+    return VR::g_openxr->GetVirtualScreenDistanceMeters();
+#endif
+  return g_ActiveConfig.vr_screen_distance;
+}
+
 struct PerspectiveHudTransform
 {
   std::array<float, 3> scale{};
@@ -137,7 +146,7 @@ PerspectiveHudTransform CalculatePerspectiveHudTransform(const Projection::Raw& 
   if (width == 0.0f || height == 0.0f || !IsFinite(width) || !IsFinite(height))
     return result;
 
-  result.distance = units_per_meter * g_ActiveConfig.vr_screen_distance;
+  result.distance = units_per_meter * GetVRScreenDistanceMeters();
   const float size_reference = units_per_meter * g_ActiveConfig.vr_screen_size;
   const float hud_width = std::abs((2.0f / projection[0]) * size_reference);
   const float hud_height = std::abs((2.0f / projection[2]) * size_reference);
@@ -350,7 +359,7 @@ void GeometryShaderManager::SetConstants(PrimitiveType prim)
           // Virtual screen params (for ortho draws: menus, FMV, HUD). In tabletop mode the UI
           // follows diorama zoom at half strength instead of staying physically huge.
           const float ui_scale = VR::g_openxr ? VR::g_openxr->GetTabletopUIPhysicalScale() : 1.0f;
-          const float dist = upm * g_ActiveConfig.vr_screen_distance;
+          const float dist = upm * GetVRScreenDistanceMeters();
           const float half_h = upm * g_ActiveConfig.vr_screen_size * ui_scale * 0.5f;
           const float half_w = half_h * (16.0f / 9.0f);
           // .w is unused since the per-draw depth layering was removed (Exact Screen Depth
@@ -661,7 +670,7 @@ void GeometryShaderManager::SetConstants(PrimitiveType prim)
           if (perspective_hud)
             constants.depth_params[3] = constants.depth_params[3] > 0.0f ?
                                             constants.depth_params[3] :
-                                            upm * g_ActiveConfig.vr_screen_distance;
+                                            upm * GetVRScreenDistanceMeters();
         }
 
         dirty = true;

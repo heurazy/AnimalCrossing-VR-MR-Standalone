@@ -1070,6 +1070,9 @@ void OpenXRManager::SetSession(XrSession session)
   m_ac_tabletop_stable_basis_valid = false;
   m_ac_tabletop_camera_anchor_valid = false;
   m_ac_tabletop_transition_active = false;
+  m_ac_tabletop_scene_id = -1;
+  m_ac_tabletop_camera_invalid_frames = 0;
+  m_ac_tabletop_next_camera_scan_time = 0;
   m_tabletop_reanchor_requested.store(false, std::memory_order_release);
 
   if (m_session == XR_NULL_HANDLE)
@@ -3388,6 +3391,18 @@ float OpenXRManager::GetTabletopUIPhysicalScale() const
   return std::clamp(ui_scale, 0.50f, 1.50f);
 }
 
+float OpenXRManager::GetVirtualScreenDistanceMeters() const
+{
+  const float configured_distance = std::max(g_ActiveConfig.vr_screen_distance, 0.05f);
+  if (!IsTabletopModeActive())
+    return configured_distance;
+
+  // DolphinXR's generic default is 1.5 m, which places Animal Crossing's speech/menu plane far
+  // behind a miniature board sitting only a few decimetres away. Keep the user's slider response
+  // but compress it for tabletop; the default becomes 0.675 m and never gets uncomfortably close.
+  return std::max(configured_distance * 0.45f, 0.30f);
+}
+
 bool OpenXRManager::GetTabletopOcclusionPlane(TabletopOcclusionPlane* out_plane) const
 {
   // Do not guess a plane before Animal Crossing's anchored camera has been captured. The old
@@ -3776,7 +3791,7 @@ void OpenXRManager::ComputeVirtualScreenHit(const Common::VR::OpenXRPoseState& a
     return;
 
   const float ui_scale = GetTabletopUIPhysicalScale();
-  const float dist = upm * g_ActiveConfig.vr_screen_distance;
+  const float dist = upm * GetVirtualScreenDistanceMeters();
   const float half_h =
       std::max(upm * g_ActiveConfig.vr_screen_size * ui_scale * 0.5f, 1e-4f);
   const float half_w = half_h * (16.0f / 9.0f);
@@ -3837,6 +3852,14 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
   constexpr uint32_t CAMERA_FAR = 0x30;
   constexpr uint32_t CAMERA_SCALE = 0x34;
   constexpr uint32_t CAMERA_MAIN_INDEX = 0x60;
+  constexpr uint32_t GAME_PLAY_CAMERA = 0x1B88;
+  constexpr uint32_t GAME_PLAY_SCENE_ID = 0x00E0;
+  constexpr uint32_t GAME_PLAY_ACTOR_INFO = 0x1DA8;
+  constexpr uint32_t GAME_PLAY_PLAYER_COUNT = 0x1DC4;
+  constexpr uint32_t GAME_PLAY_PLAYER_PTR = 0x1DC8;
+  constexpr uint32_t ACTOR_PART = 0x0002;
+  constexpr uint32_t AC_SCENE_COUNT = 52;
+  constexpr uint32_t CAMERA2_PROCESS_NORMAL = 1;
 
   auto& memory = Core::System::GetInstance().GetMemory();
   const auto read_f32 = [&memory](uint32_t address) {
@@ -3850,8 +3873,31 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
   };
 
   const auto camera_is_plausible = [&](uint32_t camera_addr, bool require_world_center) {
-    if (camera_addr < MEM1_BASE || camera_addr + CAMERA_SIZE >= MEM1_BASE + MEM1_SIZE)
+    if (camera_addr < MEM1_BASE + GAME_PLAY_CAMERA ||
+        camera_addr + CAMERA_SIZE >= MEM1_BASE + MEM1_SIZE)
+    {
       return false;
+    }
+
+    // Camera2 is embedded in GAME_PLAY. Validate a few surrounding GAME_PLAY/Actor_info fields so
+    // a stale block of memory left by the train scene cannot continue masquerading as the live
+    // camera after the town scene allocates a new instance.
+    const uint32_t play_addr = camera_addr - GAME_PLAY_CAMERA;
+    const uint32_t scene_id = memory.Read_U16(play_addr + GAME_PLAY_SCENE_ID);
+    const uint32_t total_actors = memory.Read_U32(play_addr + GAME_PLAY_ACTOR_INFO);
+    const uint32_t player_count = memory.Read_U32(play_addr + GAME_PLAY_PLAYER_COUNT);
+    if (scene_id >= AC_SCENE_COUNT || total_actors > 512 || player_count > 1)
+      return false;
+    if (player_count == 1)
+    {
+      const uint32_t player_addr = memory.Read_U32(play_addr + GAME_PLAY_PLAYER_PTR);
+      if (player_addr < MEM1_BASE || player_addr + 0x174 >= MEM1_BASE + MEM1_SIZE ||
+          memory.Read_U8(player_addr + ACTOR_PART) != 3)
+      {
+        return false;
+      }
+    }
+
     const float fov = read_f32(camera_addr + CAMERA_FOV);
     const float near_plane = read_f32(camera_addr + CAMERA_NEAR);
     const float far_plane = read_f32(camera_addr + CAMERA_FAR);
@@ -3874,30 +3920,38 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
     return true;
   };
 
+  const XrTime scan_now = m_predicted_display_time_snapshot.load(std::memory_order_acquire);
   if (m_ac_tabletop_camera_addr != 0 &&
       !camera_is_plausible(m_ac_tabletop_camera_addr, false))
   {
-    // Save/load and tiny transition views temporarily put unusual values in Camera2. The previous
-    // implementation threw away the cached address here and rescanned all 24 MiB of MEM1 every
-    // render refresh, which caused the severe save/load stalls seen on Quest. Keep the known live
-    // address and simply suspend tabletop camera compensation until Camera2 becomes valid again.
+    // Camera2 can be briefly invalid during save/load and scene transitions, so don't immediately
+    // restart the expensive MEM1 scan. If it stays invalid for several frames, however, assume the
+    // GAME_PLAY instance was replaced (train -> town is the important case) and allow one rescan.
+    ++m_ac_tabletop_camera_invalid_frames;
     m_ac_tabletop_camera_anchor_valid = false;
     m_ac_tabletop_transition_active = false;
     m_ac_tabletop_pending_block_frames = 0;
-    return false;
+    if (m_ac_tabletop_camera_invalid_frames < 12)
+      return false;
+
+    m_ac_tabletop_camera_addr = 0;
+    m_ac_tabletop_camera_invalid_frames = 0;
+    m_ac_tabletop_next_camera_scan_time = scan_now;
   }
 
   if (m_ac_tabletop_camera_addr == 0)
   {
     m_ac_tabletop_camera_anchor_valid = false;
+    if (scan_now > 0 && m_ac_tabletop_next_camera_scan_time > scan_now)
+      return false;
 
     const uint8_t* ram = memory.GetPointerForRange(MEM1_BASE, MEM1_SIZE);
     if (!ram)
       return false;
 
     // Camera2::perspective.far is normally exactly 1600.0f (44 C8 00 00). Scan raw MEM1 for
-    // that signature, then validate the surrounding Camera2 fields. This runs only when the
-    // live object is first needed or after a scene reset.
+    // that signature, then validate both Camera2 and its surrounding GAME_PLAY fields. Failed
+    // scans are throttled to 500 ms so loading screens cannot cause a 24 MiB scan every frame.
     for (size_t offset = 0; offset + CAMERA_SIZE < MEM1_SIZE; offset += 4)
     {
       const size_t far_offset = offset + CAMERA_FAR;
@@ -3914,25 +3968,57 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
         break;
       }
     }
-  }
 
-  if (m_ac_tabletop_camera_addr == 0)
-    return false;
+    if (m_ac_tabletop_camera_addr == 0)
+    {
+      if (scan_now > 0)
+        m_ac_tabletop_next_camera_scan_time = scan_now + 500'000'000;
+      return false;
+    }
+
+    m_ac_tabletop_camera_invalid_frames = 0;
+    m_ac_tabletop_next_camera_scan_time = 0;
+  }
 
   const auto eye = read_vec3(m_ac_tabletop_camera_addr + CAMERA_EYE);
   const auto center = read_vec3(m_ac_tabletop_camera_addr + CAMERA_CENTER);
   const auto up = read_vec3(m_ac_tabletop_camera_addr + CAMERA_UP);
+  const uint32_t play_addr = m_ac_tabletop_camera_addr - GAME_PLAY_CAMERA;
+  const int scene_id = static_cast<int>(memory.Read_U16(play_addr + GAME_PLAY_SCENE_ID));
+  const uint32_t camera_main_index = memory.Read_U32(m_ac_tabletop_camera_addr + CAMERA_MAIN_INDEX);
+
+  // Never carry a stable Camera2 basis across Animal Crossing scenes. In particular, the train
+  // arrival uses a different camera setup from SCENE_FG; retaining that basis is what rotated the
+  // town tabletop for some first-time users.
+  if (m_ac_tabletop_scene_id != scene_id)
+  {
+    m_ac_tabletop_scene_id = scene_id;
+    m_ac_tabletop_stable_basis_valid = false;
+    m_ac_tabletop_camera_anchor_valid = false;
+    m_ac_tabletop_transition_active = false;
+    m_ac_tabletop_pending_block_frames = 0;
+  }
 
   // Init_Camera2 briefly resets the center to the origin during scene transitions. Drop the old
   // anchor there and capture a fresh one once the new scene has a real camera.
   if (!finite_vec(eye) || !finite_vec(center) || !finite_vec(up) ||
       std::abs(center[0]) + std::abs(center[2]) < 10.0f)
   {
+    ++m_ac_tabletop_camera_invalid_frames;
     m_ac_tabletop_camera_anchor_valid = false;
     m_ac_tabletop_transition_active = false;
     m_ac_tabletop_pending_block_frames = 0;
+    if (m_ac_tabletop_camera_invalid_frames >= 30)
+    {
+      // A long invalid window generally means GAME_PLAY was replaced by a scene load. Forget the
+      // stale address, but let the throttled scanner find the new one instead of scanning each frame.
+      m_ac_tabletop_camera_addr = 0;
+      m_ac_tabletop_camera_invalid_frames = 0;
+      m_ac_tabletop_next_camera_scan_time = scan_now;
+    }
     return false;
   }
+  m_ac_tabletop_camera_invalid_frames = 0;
 
   // An acre is 16 x 40 = 640 game units. A transition must replace the old acre in the exact
   // same tabletop slot, without inheriting the transient zoom/pitch/offset of Animal Crossing's
@@ -3943,6 +4029,15 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
   constexpr int AC_BLOCK_CONFIRM_FRAMES = 4;
   const int current_block_x = static_cast<int>(std::floor(center[0] / AC_ACRE_SIZE));
   const int current_block_z = static_cast<int>(std::floor(center[2] / AC_ACRE_SIZE));
+
+  // A new scene may begin with a DEMO/DOOR camera. Use it only as a temporary anchor; as soon as
+  // Camera2 returns to NORMAL, recapture once and freeze that normal gameplay basis for the scene.
+  if (!m_ac_tabletop_stable_basis_valid && m_ac_tabletop_camera_anchor_valid &&
+      camera_main_index == CAMERA2_PROCESS_NORMAL)
+  {
+    m_ac_tabletop_camera_anchor_valid = false;
+    m_ac_tabletop_transition_active = false;
+  }
 
   if (!m_ac_tabletop_camera_anchor_valid)
   {
@@ -3962,16 +4057,19 @@ bool OpenXRManager::GetAnimalCrossingRuntimeViewTransform(
     }
     else
     {
-      // First stable tabletop capture for this XR session. Freeze its orientation and eye distance
-      // as the canonical basis used by every later re-anchor.
+      // Scripted train/door/demo cameras are allowed as temporary anchors so the scene remains
+      // usable, but only NORMAL gameplay is allowed to become the persistent basis for this scene.
       m_ac_tabletop_anchor_eye = eye;
       m_ac_tabletop_anchor_up = up;
-      for (size_t axis = 0; axis < 3; ++axis)
+      if (camera_main_index == CAMERA2_PROCESS_NORMAL)
       {
-        m_ac_tabletop_stable_eye_from_center[axis] = eye[axis] - center[axis];
+        for (size_t axis = 0; axis < 3; ++axis)
+        {
+          m_ac_tabletop_stable_eye_from_center[axis] = eye[axis] - center[axis];
+        }
+        m_ac_tabletop_stable_up = up;
+        m_ac_tabletop_stable_basis_valid = true;
       }
-      m_ac_tabletop_stable_up = up;
-      m_ac_tabletop_stable_basis_valid = true;
     }
     m_ac_tabletop_anchor_block_x = current_block_x;
     m_ac_tabletop_anchor_block_z = current_block_z;

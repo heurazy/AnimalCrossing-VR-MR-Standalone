@@ -278,12 +278,20 @@ bool BuildRuntimeControllerHand(const VR::TabletopHandMesh& mesh,
                                 const Common::VR::OpenXRControllerState& controller, int hand,
                                 std::vector<HandRoomVertex>* room_vertices)
 {
-  if (!mesh.valid || mesh.vertex_positions.empty() || mesh.indices.size() < 3)
+  // Use the runtime mesh only when optical joints are actually available. If Quest hand tracking
+  // is disabled (or temporarily unavailable while the user is holding Touch controllers), fall
+  // through to BuildControllerHand below: that fallback animates index/grip/thumb from controller
+  // inputs instead of showing a rigid bind-pose hand.
+  if (!mesh.valid || mesh.vertex_positions.empty() || mesh.indices.size() < 3 ||
+      !controller.hand_joints_valid)
+  {
     return false;
+  }
+  (void)hand;
 
   constexpr u32 SKIN = 0xFFFFFFFF;
   std::vector<HandVec3> skinned(mesh.vertex_positions.size());
-  bool used_live_skeleton = controller.hand_joints_valid;
+  bool used_live_skeleton = true;
 
   if (used_live_skeleton)
   {
@@ -334,29 +342,7 @@ bool BuildRuntimeControllerHand(const VR::TabletopHandMesh& mesh,
   }
 
   if (!used_live_skeleton)
-  {
-    if (!controller.grip_pose.valid || mesh.joint_bind_poses.size() <= XR_HAND_JOINT_WRIST_EXT)
-      return false;
-
-    // Optical tracking can briefly disappear when the controller occludes the hand. Keep the
-    // real Quest mesh instead of popping back to boxes: rigidly attach its bind-pose wrist to the
-    // Touch grip until optical joints return.
-    const XrPosef& bind_wrist = mesh.joint_bind_poses[XR_HAND_JOINT_WRIST_EXT];
-    for (size_t vertex_index = 0; vertex_index < mesh.vertex_positions.size(); ++vertex_index)
-    {
-      const XrVector3f& src = mesh.vertex_positions[vertex_index];
-      HandVec3 wrist_local =
-          InverseTransformHandPoint(bind_wrist, HandVec3{src.x, src.y, src.z});
-
-      // Small controller-to-wrist calibration. The OpenXR grip pose sits inside the Touch handle;
-      // the wrist is slightly behind and below it. Mirror the lateral correction per hand.
-      wrist_local[0] += hand == 0 ? 0.008f : -0.008f;
-      wrist_local[1] -= 0.018f;
-      wrist_local[2] += 0.035f;
-      skinned[vertex_index] = TransformHandPoint(controller.grip_pose.orientation,
-                                                 controller.grip_pose.position, wrist_local);
-    }
-  }
+    return false;
 
   const size_t before = room_vertices->size();
   room_vertices->reserve(before + mesh.indices.size());
