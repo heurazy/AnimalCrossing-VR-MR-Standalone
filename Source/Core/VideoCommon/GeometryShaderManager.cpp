@@ -42,6 +42,15 @@ float GetVRScreenDistanceMeters()
   return g_ActiveConfig.vr_screen_distance;
 }
 
+float GetVRScreenVerticalOffsetMeters()
+{
+#ifdef ENABLE_VR
+  if (VR::g_openxr)
+    return VR::g_openxr->GetVirtualScreenVerticalOffsetMeters();
+#endif
+  return 0.0f;
+}
+
 struct PerspectiveHudTransform
 {
   std::array<float, 3> scale{};
@@ -360,11 +369,12 @@ void GeometryShaderManager::SetConstants(PrimitiveType prim)
           // follows diorama zoom at half strength instead of staying physically huge.
           const float ui_scale = VR::g_openxr ? VR::g_openxr->GetTabletopUIPhysicalScale() : 1.0f;
           const float dist = upm * GetVRScreenDistanceMeters();
+          const float vertical_offset = upm * GetVRScreenVerticalOffsetMeters();
           const float half_h = upm * g_ActiveConfig.vr_screen_size * ui_scale * 0.5f;
           const float half_w = half_h * (16.0f / 9.0f);
-          // .w is unused since the per-draw depth layering was removed (Exact Screen Depth
-          // reproduces the game's own depth instead of synthesizing layer offsets).
-          constants.vr_screen = {half_w, half_h, dist, 0.0f};
+          // .w is the board-local vertical offset for world-fixed ortho UI. It is zero in normal
+          // VR, while Animal Crossing tabletop uses it to float dialogue just above the diorama.
+          constants.vr_screen = {half_w, half_h, dist, vertical_offset};
 
           if (perspective)
           {

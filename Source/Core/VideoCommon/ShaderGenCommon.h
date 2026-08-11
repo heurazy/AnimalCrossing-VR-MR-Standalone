@@ -355,7 +355,7 @@ static const char s_shader_uniforms[] = "\tuint    components;\n"
 //   offset  64: float4 ceye_proj[4]   (64 bytes) — per-eye HMD projection rows (with head rot)
 //   offset 128: float4 cvr_eye_z[2]   (32 bytes) — per-eye z-axis for depth/w recomputation
 //   offset 160: float4 cvr_depth      (16 bytes) - {P[2][2], P[2][3], depth_scale, depth_offset}
-//   offset 176: float4 cvr_screen     (16 bytes) - {half_w, half_h, distance, ortho_layer}
+//   offset 176: float4 cvr_screen     (16 bytes) - {half_w, half_h, distance, vertical_offset}
 //   offset 192: float4 cvr_head_proj[4] (64 bytes) — unrotated per-eye projection (head-locked)
 static const char s_geometry_shader_uniforms[] = "\tfloat4 " I_STEREOPARAMS ";\n"
                                                  "\tfloat4 " I_LINEPTPARAMS ";\n"

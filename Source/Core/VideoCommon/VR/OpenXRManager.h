@@ -398,6 +398,10 @@ public:
   // at roughly half strength so shrinking the diorama also shrinks the UI without making text tiny.
   float GetTabletopUIPhysicalScale() const;
 
+  // Tabletop virtual-screen placement in metres relative to the board origin. Keeping these as
+  // physical values makes menus/dialogue hover above the miniature regardless of world zoom.
+  float GetVirtualScreenVerticalOffsetMeters() const;
+
   // Effective physical distance for 2D HUD/menu planes. Animal Crossing's tabletop sits much
   // closer than DolphinXR's generic 1.5 m screen default, so keep menus readable near the diorama.
   float GetVirtualScreenDistanceMeters() const;
@@ -569,6 +573,10 @@ private:
   bool m_simultaneous_hands_controllers_active = false;
   std::array<XrHandTrackerEXT, 2> m_tabletop_hand_trackers{XR_NULL_HANDLE, XR_NULL_HANDLE};
   std::array<TabletopHandMesh, 2> m_tabletop_hand_meshes{};
+  // Learned from simultaneous Touch + optical hand tracking. Kept for the XR session so the Meta
+  // mesh remains aligned to the physical controller after optical tracking is turned off.
+  std::array<bool, 2> m_touch_wrist_calibration_valid{};
+  std::array<Common::VR::OpenXRPoseState, 2> m_touch_wrist_from_grip{};
 
   // Camera anchor state (video thread only; game units, game view space).
   // pending: raw capture from this frame's anchor draw. target: latched value the

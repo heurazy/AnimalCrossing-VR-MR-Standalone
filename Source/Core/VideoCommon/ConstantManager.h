@@ -145,7 +145,7 @@ struct alignas(16) GeometryShaderConstants
   float4 depth_params{};
   // Virtual screen params for placing 2D (ortho) content in VR:
   //   x = half-width in game units,  y = half-height in game units
-  //   z = distance in game units,    w = ortho draw layer index (for depth separation)
+  //   z = distance in game units,    w = board-local vertical offset (0 outside tabletop)
   float4 vr_screen{};
   // Unrotated per-eye projection rows for head-locked VR content (cvr_head_proj in shaders).
   // Same layout as eye_projection but WITHOUT head rotation baked in.

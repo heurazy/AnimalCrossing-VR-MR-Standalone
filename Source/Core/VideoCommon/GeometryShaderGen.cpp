@@ -498,10 +498,11 @@ ShaderCode GenerateGeometryShaderCode(APIType api_type, const ShaderHostConfig& 
       out.Write("\t\tndc_x = ndc_x * " I_VR_PANE_REMAP ".x + " I_VR_PANE_REMAP ".z;\n");
       out.Write("\t\tndc_y = ndc_y * " I_VR_PANE_REMAP ".y + " I_VR_PANE_REMAP ".w;\n");
       out.Write("\t\tfloat ndc_z_clamped = clamp(ndc_z, -1.0, 1.0);\n");
-      // cvr_screen = {half_w, half_h, distance, ortho_layer}
+      // cvr_screen = {half_w, half_h, distance, vertical_offset}. The offset is zero for normal
+      // VR and lifts Animal Crossing's world-fixed dialogue/menu plane above the tabletop.
       out.Write("\t\tfloat4 screenPos = float4(\n");
       out.Write("\t\t\tndc_x * " I_VR_SCREEN ".x,\n");
-      out.Write("\t\t\tndc_y * " I_VR_SCREEN ".y,\n");
+      out.Write("\t\t\tndc_y * " I_VR_SCREEN ".y + " I_VR_SCREEN ".w,\n");
       // Spread 2D content over real depth (cvr_depth.z = HUD thickness) so elements at
       // different ortho-Z get binocular parallax instead of all sitting on one flat plane.
       out.Write("\t\t\t-" I_VR_SCREEN ".z + ndc_z_clamped * " I_VR_DEPTH ".z,\n");

@@ -66,6 +66,11 @@ struct OpenXRControllerState
   // active alongside Touch controllers through XR_META_simultaneous_hands_and_controllers.
   bool hand_joints_valid = false;
   std::array<OpenXRPoseState, 26> hand_joints{};
+  // Persistent controller-to-wrist calibration captured whenever optical hand tracking and the
+  // Touch grip pose are both valid. The renderer can reuse this exact Meta/OpenXR wrist alignment
+  // after optical hand tracking is disabled instead of relying on a guessed controller offset.
+  bool hand_wrist_from_grip_valid = false;
+  OpenXRPoseState hand_wrist_from_grip;
   OpenXRScreenHit screen_hit;
 };
 

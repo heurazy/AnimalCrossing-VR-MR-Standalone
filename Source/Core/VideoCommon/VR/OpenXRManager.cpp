@@ -1065,6 +1065,8 @@ void OpenXRManager::SetSession(XrSession session)
   m_session = session;
   m_tabletop_runtime_enabled.store(g_ActiveConfig.vr_tabletop_mode, std::memory_order_release);
   m_tabletop_toggle_right_stick_was_down = false;
+  m_touch_wrist_calibration_valid = {false, false};
+  m_touch_wrist_from_grip = {};
   // A fresh XR session gets a fresh canonical Animal Crossing tabletop basis. Later runtime camera
   // toggles intentionally keep this basis so transient Camera2 pitch/roll cannot tilt the board.
   m_ac_tabletop_stable_basis_valid = false;
@@ -1100,16 +1102,18 @@ void OpenXRManager::SetSession(XrSession session)
   {
     INFO_LOG_FMT(OPENXR, "OpenXR: Runtime hand mesh unavailable; tabletop hands use fallback.");
   }
-  else if (m_xrResumeSimultaneousHandsAndControllersTrackingMETA)
+  else
   {
-    XrSimultaneousHandsAndControllersTrackingResumeInfoMETA resume_info{
-        XR_TYPE_SIMULTANEOUS_HANDS_AND_CONTROLLERS_TRACKING_RESUME_INFO_META};
-    const XrResult resume_result =
-        m_xrResumeSimultaneousHandsAndControllersTrackingMETA(m_session, &resume_info);
-    m_simultaneous_hands_controllers_active = XR_SUCCEEDED(resume_result);
-    INFO_LOG_FMT(OPENXR, "OpenXR: simultaneous optical hands + Touch controllers: {} ({}).",
-                 m_simultaneous_hands_controllers_active ? "enabled" : "unavailable",
-                 static_cast<int>(resume_result));
+    // Do not resume XR_META_simultaneous_hands_and_controllers for controller-driven tabletop
+    // hands. On Quest 3 the held/unheld detector can switch /user/hand/* between controller and
+    // hand interaction profiles independently, which makes Touch action states disappear even
+    // while the physical controllers are being used. We only need XR_FB_hand_tracking_mesh here:
+    // its immutable Meta mesh has already been queried above, so keep simultaneous tracking paused
+    // and let the runtime expose the normal stable Touch controller interaction profiles.
+    m_simultaneous_hands_controllers_active = false;
+    INFO_LOG_FMT(OPENXR,
+                 "OpenXR: Meta runtime hand mesh ready; simultaneous hands/controllers left paused "
+                 "for stable Touch input.");
   }
 }
 
@@ -1615,6 +1619,8 @@ bool OpenXRManager::InitializeTabletopHandMeshes()
       WARN_LOG_FMT(OPENXR, "OpenXR: hand mesh size query for hand {} failed ({}) j={} v={} i={}.",
                    hand, static_cast<int>(result), query.jointCountOutput,
                    query.vertexCountOutput, query.indexCountOutput);
+      m_xrDestroyHandTrackerEXT(m_tabletop_hand_trackers[hand]);
+      m_tabletop_hand_trackers[hand] = XR_NULL_HANDLE;
       continue;
     }
 
@@ -1649,6 +1655,8 @@ bool OpenXRManager::InitializeTabletopHandMeshes()
       WARN_LOG_FMT(OPENXR, "OpenXR: xrGetHandMeshFB({}) failed ({}).", hand,
                    static_cast<int>(result));
       data = {};
+      m_xrDestroyHandTrackerEXT(m_tabletop_hand_trackers[hand]);
+      m_tabletop_hand_trackers[hand] = XR_NULL_HANDLE;
       continue;
     }
 
@@ -1660,6 +1668,11 @@ bool OpenXRManager::InitializeTabletopHandMeshes()
                    hand == 0 ? "left" : "right", mesh.vertexCountOutput,
                    mesh.indexCountOutput, mesh.jointCountOutput);
     }
+
+    // Keep the tracker alive for true optical hand tracking. XR_META_simultaneous_hands_and_controllers
+    // remains paused, so Quest can naturally switch between controller input and hand tracking.
+    // When optical joints are inactive, the renderer falls back to the controller-driven Valve/FK
+    // hand pose; when they become valid, those runtime joints take priority.
   }
 
   return any_mesh;
@@ -1785,6 +1798,11 @@ bool OpenXRManager::InitializeInputActions()
     suggested.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
     suggested.suggestedBindings = bindings.data();
     const XrResult suggest_result = xrSuggestInteractionProfileBindings(m_instance, &suggested);
+#if defined(ANDROID)
+    __android_log_print(ANDROID_LOG_INFO, "ACVRBindings", "profile=%s result=%d bindings=%u",
+                        profile, static_cast<int>(suggest_result),
+                        static_cast<unsigned>(bindings.size()));
+#endif
     if (XR_FAILED(suggest_result))
     {
       WARN_LOG_FMT(OPENXR,
@@ -1840,10 +1858,10 @@ bool OpenXRManager::InitializeInputActions()
                        {m_action_haptic, "/user/hand/right/output/haptic"},
                    });
 
-  // Meta Touch Plus (promoted from touch_controller_plus in 1.1): NO trigger/click or squeeze/click.
-  // Requires XR_META_touch_controller_plus extension (or 1.1 runtime).
-  if (IsExtensionEnabled(XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME))
-  {
+  // Meta Touch Plus profiles are core-promoted on current Quest runtimes. Do not gate binding
+  // suggestions on XR_META_touch_controller_plus: Horizon OS may expose the promoted profile
+  // without advertising/enabling the legacy extension name. Unsupported profiles simply cause
+  // xrSuggestInteractionProfileBindings to fail harmlessly inside suggest_bindings().
   suggest_bindings("/interaction_profiles/meta/touch_plus_controller",
                    {
                        {m_action_primary_click, "/user/hand/left/input/x/click"},
@@ -1897,7 +1915,6 @@ bool OpenXRManager::InitializeInputActions()
                        {m_action_haptic, "/user/hand/left/output/haptic"},
                        {m_action_haptic, "/user/hand/right/output/haptic"},
                    });
-  }  // XR_META_touch_controller_plus
 
   // Meta Quest 2 controller (1.1 core profile): NO trigger/click or squeeze/click.
   // Available on 1.1 runtimes without extension; will gracefully fail on 1.0.
@@ -1926,7 +1943,6 @@ bool OpenXRManager::InitializeInputActions()
                        {m_action_haptic, "/user/hand/left/output/haptic"},
                        {m_action_haptic, "/user/hand/right/output/haptic"},
                    });
-
   // Valve Index: has trigger/click but NOT squeeze/click (has squeeze/value + squeeze/force).
   suggest_bindings("/interaction_profiles/valve/index_controller",
                    {
@@ -2409,6 +2425,13 @@ void OpenXRManager::UpdateInputActions()
     }
   };
 
+  static uint64_t s_action_diag_counter = 0;
+  static std::array<float, 2> s_peak_trigger{};
+  static std::array<float, 2> s_peak_squeeze{};
+  static std::array<bool, 2> s_peak_primary{};
+  static std::array<bool, 2> s_peak_secondary{};
+  const bool log_action_diag = (++s_action_diag_counter % 300) == 1;
+
   for (size_t hand = 0; hand < controllers.size(); ++hand)
   {
     const XrPath hand_path = m_input_hand_paths[hand];
@@ -2428,6 +2451,10 @@ void OpenXRManager::UpdateInputActions()
     }
 
     bool action_seen = false;
+    bool trigger_action_active = false;
+    bool squeeze_action_active = false;
+    bool aim_action_active = false;
+    bool grip_action_active = false;
     const auto get_boolean = [this, hand_path, &action_seen](XrAction action) -> bool {
       XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
       get_info.action = action;
@@ -2439,15 +2466,32 @@ void OpenXRManager::UpdateInputActions()
       return state.currentState == XR_TRUE;
     };
 
-    const auto get_float = [this, hand_path, &action_seen](XrAction action) -> float {
+    const auto get_float = [this, hand_path, &action_seen](XrAction action,
+                                                           bool* out_active = nullptr) -> float {
       XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
       get_info.action = action;
       get_info.subactionPath = hand_path;
       XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
       if (XR_FAILED(xrGetActionStateFloat(m_session, &get_info, &state)))
+      {
+        if (out_active)
+          *out_active = false;
         return 0.0f;
-      action_seen |= (state.isActive == XR_TRUE);
+      }
+      const bool active = state.isActive == XR_TRUE;
+      if (out_active)
+        *out_active = active;
+      action_seen |= active;
       return state.currentState;
+    };
+
+    const auto get_pose_active = [this, hand_path](XrAction action) -> bool {
+      XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
+      get_info.action = action;
+      get_info.subactionPath = hand_path;
+      XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
+      return XR_SUCCEEDED(xrGetActionStatePose(m_session, &get_info, &state)) &&
+             state.isActive == XR_TRUE;
     };
 
     controller.primary_button = get_boolean(m_action_primary_click);
@@ -2458,16 +2502,24 @@ void OpenXRManager::UpdateInputActions()
     const bool trigger_click = get_boolean(m_action_trigger_click);
     const bool squeeze_click = get_boolean(m_action_squeeze_click);
 
-    controller.trigger_value = std::clamp(get_float(m_action_trigger_value), 0.0f, 1.0f);
-    controller.squeeze_value = std::clamp(get_float(m_action_squeeze_value), 0.0f, 1.0f);
+    controller.trigger_value =
+        std::clamp(get_float(m_action_trigger_value, &trigger_action_active), 0.0f, 1.0f);
+    controller.squeeze_value =
+        std::clamp(get_float(m_action_squeeze_value, &squeeze_action_active), 0.0f, 1.0f);
     controller.squeeze_force = std::clamp(get_float(m_action_squeeze_force), 0.0f, 1.0f);
     controller.thumbstick_x = std::clamp(get_float(m_action_thumbstick_x), -1.0f, 1.0f);
     controller.thumbstick_y = std::clamp(get_float(m_action_thumbstick_y), -1.0f, 1.0f);
+    aim_action_active = get_pose_active(m_action_aim_pose);
+    grip_action_active = get_pose_active(m_action_grip_pose);
+    action_seen |= aim_action_active || grip_action_active;
 
     locate_space_state(m_aim_spaces[hand], m_frame_state.predictedDisplayTime,
                        &controller.aim_pose, nullptr);
-    locate_space_state(m_grip_spaces[hand], input_time, &controller.grip_pose,
-                       &controller.grip_velocity);
+    // Match Meta's XrInput sample: action-space poses are located at the frame's predicted display
+    // time. Querying Touch grip space at a converted wall-clock "now" can leave an otherwise active
+    // pose with no valid location on Quest.
+    locate_space_state(m_grip_spaces[hand], m_frame_state.predictedDisplayTime,
+                       &controller.grip_pose, &controller.grip_velocity);
 
     // Quest 3 can optically track the real hand while Touch controllers remain active. Feed the
     // runtime skeleton to the hand renderer when available; this gives real per-finger motion
@@ -2508,6 +2560,74 @@ void OpenXRManager::UpdateInputActions()
       }
     }
 
+    // Learn the physical Touch grip -> optical wrist transform whenever both tracking sources are
+    // available. This is substantially more accurate than a hard-coded Quest-controller offset and
+    // remains cached for the rest of the XR session when optical hand tracking is later disabled.
+    if (controller.hand_joints_valid && controller.grip_pose.valid &&
+        controller.hand_joints[XR_HAND_JOINT_WRIST_EXT].valid)
+    {
+      const auto& grip = controller.grip_pose;
+      const auto& wrist = controller.hand_joints[XR_HAND_JOINT_WRIST_EXT];
+      const XrQuaternionf grip_q{grip.orientation[0], grip.orientation[1], grip.orientation[2],
+                                 grip.orientation[3]};
+      const XrQuaternionf inv_grip{-grip_q.x, -grip_q.y, -grip_q.z, grip_q.w};
+      const XrQuaternionf wrist_q{wrist.orientation[0], wrist.orientation[1],
+                                  wrist.orientation[2], wrist.orientation[3]};
+      const XrQuaternionf relative_q = MultiplyQuaternions(inv_grip, wrist_q);
+      const XrQuaternionf delta_q{wrist.position[0] - grip.position[0],
+                                  wrist.position[1] - grip.position[1],
+                                  wrist.position[2] - grip.position[2], 0.0f};
+      const XrQuaternionf relative_p_q =
+          MultiplyQuaternions(MultiplyQuaternions(inv_grip, delta_q), grip_q);
+
+      Common::VR::OpenXRPoseState sample;
+      sample.valid = true;
+      sample.position = {relative_p_q.x, relative_p_q.y, relative_p_q.z};
+      sample.orientation = {relative_q.x, relative_q.y, relative_q.z, relative_q.w};
+
+      if (!m_touch_wrist_calibration_valid[hand])
+      {
+        m_touch_wrist_from_grip[hand] = sample;
+        m_touch_wrist_calibration_valid[hand] = true;
+      }
+      else
+      {
+        // Low-pass the optical sample because simultaneous hand+controller tracking can jitter when
+        // fingers are partially hidden by the Touch controller. Position uses a simple EMA;
+        // orientation uses hemisphere-corrected normalized linear interpolation.
+        constexpr float CALIBRATION_BLEND = 0.08f;
+        auto& filtered = m_touch_wrist_from_grip[hand];
+        for (size_t axis = 0; axis < 3; ++axis)
+        {
+          filtered.position[axis] +=
+              (sample.position[axis] - filtered.position[axis]) * CALIBRATION_BLEND;
+        }
+
+        float dot = 0.0f;
+        for (size_t axis = 0; axis < 4; ++axis)
+          dot += filtered.orientation[axis] * sample.orientation[axis];
+        const float sign = dot < 0.0f ? -1.0f : 1.0f;
+        float length_sq = 0.0f;
+        for (size_t axis = 0; axis < 4; ++axis)
+        {
+          filtered.orientation[axis] +=
+              (sample.orientation[axis] * sign - filtered.orientation[axis]) * CALIBRATION_BLEND;
+          length_sq += filtered.orientation[axis] * filtered.orientation[axis];
+        }
+        if (length_sq > 1.0e-8f)
+        {
+          const float inv_length = 1.0f / std::sqrt(length_sq);
+          for (float& component : filtered.orientation)
+            component *= inv_length;
+        }
+        filtered.valid = true;
+      }
+    }
+
+    controller.hand_wrist_from_grip_valid = m_touch_wrist_calibration_valid[hand];
+    if (controller.hand_wrist_from_grip_valid)
+      controller.hand_wrist_from_grip = m_touch_wrist_from_grip[hand];
+
     // Absolute pointing target for the emulated Wii Remote IR: where the aim ray meets
     // the virtual screen the renderer is actually displaying. Uses a dedicated measured
     // "now" locate of the aim pose — the display-time aim above stays reserved for the
@@ -2520,11 +2640,40 @@ void OpenXRManager::UpdateInputActions()
     controller.trigger_button = trigger_click || controller.trigger_value > 0.5f;
     controller.squeeze_button =
         squeeze_click || std::max(controller.squeeze_value, controller.squeeze_force) > 0.5f;
-    controller.hand_trigger_value = controller.trigger_value;
-    controller.hand_squeeze_value = std::max(controller.squeeze_value, controller.squeeze_force);
+    // Visual fallback hands must still articulate on runtimes that expose only digital click
+    // states for a control. Quest Touch normally supplies analog values, but maxing with clicks
+    // makes the fallback deterministic when system hand tracking is disabled or bindings vary.
+    controller.hand_trigger_value =
+        std::max(controller.trigger_value, trigger_click ? 1.0f : 0.0f);
+    controller.hand_squeeze_value =
+        std::max({controller.squeeze_value, controller.squeeze_force,
+                  squeeze_click ? 1.0f : 0.0f});
     controller.hand_thumb_pressed =
         controller.primary_button || controller.secondary_button || controller.thumbstick_button;
     controller.connected = action_seen || controller.aim_pose.valid || controller.grip_pose.valid;
+    s_peak_trigger[hand] = std::max(s_peak_trigger[hand], controller.hand_trigger_value);
+    s_peak_squeeze[hand] = std::max(s_peak_squeeze[hand], controller.hand_squeeze_value);
+    s_peak_primary[hand] = s_peak_primary[hand] || controller.primary_button;
+    s_peak_secondary[hand] = s_peak_secondary[hand] || controller.secondary_button;
+#if defined(ANDROID)
+    if (log_action_diag)
+    {
+      const std::string profile = PathToString(m_instance, interaction_profile_state.interactionProfile);
+      __android_log_print(
+          ANDROID_LOG_INFO, "ACVRActionState",
+          "%s profile=%s trigActive=%d squeezeActive=%d aimActive=%d gripActive=%d aimValid=%d gripValid=%d peakTrig=%.2f peakGrip=%.2f peakP=%d peakS=%d",
+          hand == 0 ? "L" : "R", profile.empty() ? "<null>" : profile.c_str(),
+          trigger_action_active ? 1 : 0, squeeze_action_active ? 1 : 0,
+          aim_action_active ? 1 : 0, grip_action_active ? 1 : 0,
+          controller.aim_pose.valid ? 1 : 0, controller.grip_pose.valid ? 1 : 0,
+          s_peak_trigger[hand], s_peak_squeeze[hand], s_peak_primary[hand] ? 1 : 0,
+          s_peak_secondary[hand] ? 1 : 0);
+      s_peak_trigger[hand] = 0.0f;
+      s_peak_squeeze[hand] = 0.0f;
+      s_peak_primary[hand] = false;
+      s_peak_secondary[hand] = false;
+    }
+#endif
   }
 
   // Right Touch thumbstick click switches between the room-anchored tabletop and the normal VR
@@ -2548,10 +2697,29 @@ void OpenXRManager::UpdateInputActions()
   static uint64_t s_sync_log_counter = 0;
   if ((++s_sync_log_counter % 300) == 1)
   {
-    INFO_LOG_FMT(OPENXR,
-                 "OpenXR input: sync={}, focused={}, left_connected={}, right_connected={}",
-                 static_cast<int>(sync_result), m_session_focused.load(),
-                 controllers[0].connected, controllers[1].connected);
+    INFO_LOG_FMT(
+        OPENXR,
+        "OpenXR input: sync={}, focused={}, L(conn={} grip={} joints={} calib={} trig={:.2f} squeeze={:.2f} A={} B={}) R(conn={} grip={} joints={} calib={} trig={:.2f} squeeze={:.2f} A={} B={})",
+        static_cast<int>(sync_result), m_session_focused.load(), controllers[0].connected,
+        controllers[0].grip_pose.valid, controllers[0].hand_joints_valid,
+        controllers[0].hand_wrist_from_grip_valid, controllers[0].hand_trigger_value,
+        controllers[0].hand_squeeze_value, controllers[0].primary_button,
+        controllers[0].secondary_button, controllers[1].connected,
+        controllers[1].grip_pose.valid, controllers[1].hand_joints_valid,
+        controllers[1].hand_wrist_from_grip_valid, controllers[1].hand_trigger_value,
+        controllers[1].hand_squeeze_value, controllers[1].primary_button,
+        controllers[1].secondary_button);
+#if defined(ANDROID)
+    __android_log_print(
+        ANDROID_LOG_INFO, "ACVRInput",
+        "L(conn=%d gripPose=%d trig=%.2f squeeze=%.2f X/A=%d Y/B=%d) R(conn=%d gripPose=%d trig=%.2f squeeze=%.2f A=%d B=%d)",
+        controllers[0].connected ? 1 : 0, controllers[0].grip_pose.valid ? 1 : 0,
+        controllers[0].hand_trigger_value, controllers[0].hand_squeeze_value,
+        controllers[0].primary_button ? 1 : 0, controllers[0].secondary_button ? 1 : 0,
+        controllers[1].connected ? 1 : 0, controllers[1].grip_pose.valid ? 1 : 0,
+        controllers[1].hand_trigger_value, controllers[1].hand_squeeze_value,
+        controllers[1].primary_button ? 1 : 0, controllers[1].secondary_button ? 1 : 0);
+#endif
   }
 
   // Provide HMD head orientation for IR pointer reference direction.
@@ -3397,10 +3565,21 @@ float OpenXRManager::GetVirtualScreenDistanceMeters() const
   if (!IsTabletopModeActive())
     return configured_distance;
 
-  // DolphinXR's generic default is 1.5 m, which places Animal Crossing's speech/menu plane far
-  // behind a miniature board sitting only a few decimetres away. Keep the user's slider response
-  // but compress it for tabletop; the default becomes 0.675 m and never gets uncomfortably close.
-  return std::max(configured_distance * 0.45f, 0.30f);
+  // In tabletop the synthetic screen is expressed relative to the board origin, not the user's
+  // head. A long 1.5 m game-screen distance therefore drives dialogue down/away with the pitched
+  // diorama. Compress it heavily: the stock 1.5 m setting becomes 0.25 m in board-local Z.
+  return std::clamp(configured_distance / 6.0f, 0.18f, 0.45f);
+}
+
+float OpenXRManager::GetVirtualScreenVerticalOffsetMeters() const
+{
+  if (!IsTabletopModeActive())
+    return 0.0f;
+
+  // Lift dialogue/menu geometry in the tabletop's local Y before the rig pitch is applied. With
+  // the default -45 degree pitch and 0.25 m local-Z distance this puts the panel centre roughly
+  // 20 cm above the physical board instead of below/behind it.
+  return 0.55f;
 }
 
 bool OpenXRManager::GetTabletopOcclusionPlane(TabletopOcclusionPlane* out_plane) const
@@ -3792,6 +3971,7 @@ void OpenXRManager::ComputeVirtualScreenHit(const Common::VR::OpenXRPoseState& a
 
   const float ui_scale = GetTabletopUIPhysicalScale();
   const float dist = upm * GetVirtualScreenDistanceMeters();
+  const float vertical_offset = upm * GetVirtualScreenVerticalOffsetMeters();
   const float half_h =
       std::max(upm * g_ActiveConfig.vr_screen_size * ui_scale * 0.5f, 1e-4f);
   const float half_w = half_h * (16.0f / 9.0f);
@@ -3802,7 +3982,7 @@ void OpenXRManager::ComputeVirtualScreenHit(const Common::VR::OpenXRPoseState& a
 
   out_hit->valid = true;
   out_hit->u = (pos[0] + t * dx) / half_w;
-  out_hit->v = (pos[1] + t * dy) / half_h;
+  out_hit->v = (pos[1] + t * dy - vertical_offset) / half_h;
   // Perpendicular distance to the screen plane (see the flat-mode note above).
   out_hit->distance_m = (pos[2] + dist) / upm;
 }

@@ -32,6 +32,7 @@
 
 #ifdef ENABLE_VR
 #include <chrono>
+#include <limits>
 #include <vector>
 #include "Common/Logging/Log.h"
 #include "Common/Timer.h"
@@ -201,60 +202,6 @@ void AppendTabletopClippedHandTriangle(std::vector<HandRoomVertex>* vertices,
   }
 }
 
-void AppendHandQuad(std::vector<HandRoomVertex>* vertices, const HandVec3& a,
-                    const HandVec3& b, const HandVec3& c, const HandVec3& d, u32 color)
-{
-  AppendHandTriangle(vertices, a, b, c, color);
-  AppendHandTriangle(vertices, a, c, d, color);
-}
-
-void AppendHandBox(std::vector<HandRoomVertex>* vertices, const HandVec3& center,
-                   const HandVec3& half, u32 color)
-{
-  std::array<HandVec3, 8> p{};
-  for (int z = 0; z < 2; ++z)
-  {
-    for (int y = 0; y < 2; ++y)
-    {
-      for (int x = 0; x < 2; ++x)
-      {
-        const int i = x | (y << 1) | (z << 2);
-        p[i] = {center[0] + (x ? half[0] : -half[0]),
-                center[1] + (y ? half[1] : -half[1]),
-                center[2] + (z ? half[2] : -half[2])};
-      }
-    }
-  }
-  AppendHandQuad(vertices, p[0], p[1], p[3], p[2], color);
-  AppendHandQuad(vertices, p[4], p[6], p[7], p[5], color);
-  AppendHandQuad(vertices, p[0], p[4], p[5], p[1], color);
-  AppendHandQuad(vertices, p[2], p[3], p[7], p[6], color);
-  AppendHandQuad(vertices, p[0], p[2], p[6], p[4], color);
-  AppendHandQuad(vertices, p[1], p[5], p[7], p[3], color);
-}
-
-void AppendHandSegment(std::vector<HandRoomVertex>* vertices, const HandVec3& a,
-                       const HandVec3& b, float width, float thickness, u32 color)
-{
-  const HandVec3 dir = HandNormalize(HandSub(b, a));
-  HandVec3 ref = std::abs(dir[1]) < 0.85f ? HandVec3{0.0f, 1.0f, 0.0f} :
-                                            HandVec3{1.0f, 0.0f, 0.0f};
-  const HandVec3 u = HandMul(HandNormalize(HandCross(dir, ref)), width * 0.5f);
-  const HandVec3 v = HandMul(HandNormalize(HandCross(u, dir)), thickness * 0.5f);
-
-  const std::array<HandVec3, 8> p = {
-      HandSub(HandSub(a, u), v), HandAdd(HandSub(a, v), u), HandAdd(HandAdd(a, u), v),
-      HandAdd(HandSub(a, u), v), HandSub(HandSub(b, u), v), HandAdd(HandSub(b, v), u),
-      HandAdd(HandAdd(b, u), v), HandAdd(HandSub(b, u), v)};
-
-  AppendHandQuad(vertices, p[0], p[1], p[2], p[3], color);
-  AppendHandQuad(vertices, p[4], p[7], p[6], p[5], color);
-  AppendHandQuad(vertices, p[0], p[4], p[5], p[1], color);
-  AppendHandQuad(vertices, p[1], p[5], p[6], p[2], color);
-  AppendHandQuad(vertices, p[2], p[6], p[7], p[3], color);
-  AppendHandQuad(vertices, p[3], p[7], p[4], p[0], color);
-}
-
 HandVec3 TransformHandPoint(const std::array<float, 4>& orientation,
                             const std::array<float, 3>& position, const HandVec3& point)
 {
@@ -274,75 +221,621 @@ HandVec3 InverseTransformHandPoint(const XrPosef& pose, const HandVec3& point)
   return RotateHandVector(inverse_q, translated);
 }
 
+XrQuaternionf NormalizeHandQuaternion(XrQuaternionf q)
+{
+  const float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (len <= 1.0e-6f)
+    return {0.0f, 0.0f, 0.0f, 1.0f};
+  const float inv = 1.0f / len;
+  return {q.x * inv, q.y * inv, q.z * inv, q.w * inv};
+}
+
+XrQuaternionf MultiplyHandQuaternions(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+  return NormalizeHandQuaternion(
+      {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+       a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+       a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+       a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z});
+}
+
+XrQuaternionf HandAxisAngle(const HandVec3& axis, float angle)
+{
+  const HandVec3 unit_axis = HandNormalize(axis);
+  const float half = angle * 0.5f;
+  const float s = std::sin(half);
+  return {unit_axis[0] * s, unit_axis[1] * s, unit_axis[2] * s, std::cos(half)};
+}
+
+XrQuaternionf InverseHandQuaternion(const XrQuaternionf& q)
+{
+  const XrQuaternionf normalized = NormalizeHandQuaternion(q);
+  return {-normalized.x, -normalized.y, -normalized.z, normalized.w};
+}
+
+XrQuaternionf BlendHandQuaternion(const XrQuaternionf& a, XrQuaternionf b, float t)
+{
+  t = std::clamp(t, 0.0f, 1.0f);
+  XrQuaternionf from = NormalizeHandQuaternion(a);
+  b = NormalizeHandQuaternion(b);
+  float dot = from.x * b.x + from.y * b.y + from.z * b.z + from.w * b.w;
+  if (dot < 0.0f)
+  {
+    b = {-b.x, -b.y, -b.z, -b.w};
+    dot = -dot;
+  }
+
+  dot = std::clamp(dot, -1.0f, 1.0f);
+  if (dot > 0.9995f)
+  {
+    return NormalizeHandQuaternion(
+        {from.x + (b.x - from.x) * t, from.y + (b.y - from.y) * t,
+         from.z + (b.z - from.z) * t, from.w + (b.w - from.w) * t});
+  }
+
+  const float theta = std::acos(dot);
+  const float sin_theta = std::sin(theta);
+  if (std::abs(sin_theta) < 1.0e-6f)
+    return from;
+
+  const float from_weight = std::sin((1.0f - t) * theta) / sin_theta;
+  const float to_weight = std::sin(t * theta) / sin_theta;
+  return NormalizeHandQuaternion({from.x * from_weight + b.x * to_weight,
+                                  from.y * from_weight + b.y * to_weight,
+                                  from.z * from_weight + b.z * to_weight,
+                                  from.w * from_weight + b.w * to_weight});
+}
+
+// Godot XR Tools default right-hand pose uses Grip 5.res as the open pose and Grip.res as the
+// closed pose. These are the exact local bone rotations stored by those animations, in track order.
+// The left-hand resources mirror Y/Z, so we can derive them without maintaining a second table.
+constexpr std::array<XrHandJointEXT, 19> GODOT_HAND_TRACK_JOINTS = {{
+    XR_HAND_JOINT_THUMB_METACARPAL_EXT,
+    XR_HAND_JOINT_THUMB_PROXIMAL_EXT,
+    XR_HAND_JOINT_THUMB_DISTAL_EXT,
+    XR_HAND_JOINT_INDEX_METACARPAL_EXT,
+    XR_HAND_JOINT_INDEX_PROXIMAL_EXT,
+    XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT,
+    XR_HAND_JOINT_INDEX_DISTAL_EXT,
+    XR_HAND_JOINT_MIDDLE_METACARPAL_EXT,
+    XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT,
+    XR_HAND_JOINT_MIDDLE_INTERMEDIATE_EXT,
+    XR_HAND_JOINT_MIDDLE_DISTAL_EXT,
+    XR_HAND_JOINT_RING_METACARPAL_EXT,
+    XR_HAND_JOINT_RING_PROXIMAL_EXT,
+    XR_HAND_JOINT_RING_INTERMEDIATE_EXT,
+    XR_HAND_JOINT_RING_DISTAL_EXT,
+    XR_HAND_JOINT_LITTLE_METACARPAL_EXT,
+    XR_HAND_JOINT_LITTLE_PROXIMAL_EXT,
+    XR_HAND_JOINT_LITTLE_INTERMEDIATE_EXT,
+    XR_HAND_JOINT_LITTLE_DISTAL_EXT,
+}};
+
+constexpr std::array<XrQuaternionf, 19> GODOT_RIGHT_OPEN = {{
+    {-0.090444073f, 0.041517481f, 0.166293472f, 0.981041610f},
+    {-0.046619851f, -0.020970983f, -0.010327632f, 0.998639166f},
+    {-0.001284546f, 0.011608096f, 0.016825879f, 0.999790251f},
+    {0.102924921f, 0.009932086f, 0.007944196f, 0.994607806f},
+    {-0.012859004f, 0.023610815f, 0.323258311f, 0.945928752f},
+    {0.012057537f, 0.009291926f, 0.247472256f, 0.968775511f},
+    {-0.035753887f, 0.000400033f, -0.006367633f, 0.999340355f},
+    {-0.002649636f, 0.001144711f, 0.125991791f, 0.992027104f},
+    {0.039422531f, -0.001933927f, 0.228074118f, 0.972843468f},
+    {-0.012339469f, 0.008812944f, 0.280669093f, 0.959684849f},
+    {-0.070265576f, -0.010190837f, 0.024330752f, 0.997179568f},
+    {-0.032063454f, 0.002236245f, 0.068636559f, 0.997123897f},
+    {0.025345206f, -0.008124619f, 0.249005452f, 0.968136311f},
+    {0.002522330f, -0.007880733f, 0.243203878f, 0.969940007f},
+    {-0.091736883f, -0.020302719f, 0.010182976f, 0.995524228f},
+    {-0.062518172f, 0.000225722f, 0.115392826f, 0.991350532f},
+    {0.058578640f, -0.021648303f, 0.269905210f, 0.960859597f},
+    {0.006871763f, 0.003572745f, 0.211952537f, 0.977249324f},
+    {0.323536992f, 0.000025657f, 0.027220426f, 0.945823908f},
+}};
+
+constexpr std::array<XrQuaternionf, 19> GODOT_RIGHT_CLOSED = {{
+    {0.329559475f, -0.254927784f, 0.152024835f, 0.896264970f},
+    {-0.303609967f, -0.062464122f, 0.228709221f, 0.922827899f},
+    {-0.421074748f, 0.118121445f, 0.243319094f, 0.865759373f},
+    {-0.001284546f, 0.011608096f, 0.016825879f, 0.999790251f},
+    {0.024201123f, 0.046170827f, 0.651622951f, 0.756749690f},
+    {-0.002395436f, 0.020050196f, 0.657487631f, 0.753194690f},
+    {-0.036981970f, -0.034581255f, 0.793887198f, 0.605953455f},
+    {-0.035753887f, 0.000400033f, -0.006367633f, 0.999340355f},
+    {0.044671372f, 0.011272614f, 0.686928332f, 0.725263298f},
+    {0.028719656f, 0.018174244f, 0.648451388f, 0.760496974f},
+    {-0.013303184f, 0.031132488f, 0.815732896f, 0.577437162f},
+    {-0.070265576f, -0.010190837f, 0.024330752f, 0.997179568f},
+    {0.082144149f, 0.004789548f, 0.610544562f, 0.787695885f},
+    {0.056462385f, 0.046940714f, 0.622986674f, 0.778778672f},
+    {0.081240460f, 0.022468932f, 0.834616899f, 0.544343412f},
+    {-0.091736883f, -0.020302719f, 0.010182976f, 0.995524228f},
+    {0.103134386f, 0.027251659f, 0.608737350f, 0.786167622f},
+    {0.098543160f, 0.051522903f, 0.656269729f, 0.746287286f},
+    {0.126803875f, 0.053291064f, 0.791772723f, 0.595127583f},
+}};
+
+XrQuaternionf GetGodotHandQuaternion(const XrQuaternionf& right_hand_quaternion, int hand)
+{
+  if (hand == 0)
+  {
+    // Godot's left-hand Grip resources are exact mirrors of the right-hand animation on Y/Z.
+    return {right_hand_quaternion.x, -right_hand_quaternion.y, -right_hand_quaternion.z,
+            right_hand_quaternion.w};
+  }
+  return right_hand_quaternion;
+}
+
+XrPosef GetRuntimeHandLocalBindPose(const VR::TabletopHandMesh& mesh, size_t joint)
+{
+  const XrPosef& global = mesh.joint_bind_poses[joint];
+  const int parent = static_cast<int>(mesh.joint_parents[joint]);
+  if (parent < 0 || static_cast<size_t>(parent) >= mesh.joint_bind_poses.size() ||
+      static_cast<size_t>(parent) == joint)
+  {
+    return global;
+  }
+
+  const XrPosef& parent_global = mesh.joint_bind_poses[static_cast<size_t>(parent)];
+  const XrQuaternionf inverse_parent = InverseHandQuaternion(parent_global.orientation);
+  const std::array<float, 4> inverse_parent_q{inverse_parent.x, inverse_parent.y, inverse_parent.z,
+                                               inverse_parent.w};
+  const HandVec3 offset = {global.position.x - parent_global.position.x,
+                           global.position.y - parent_global.position.y,
+                           global.position.z - parent_global.position.z};
+  const HandVec3 local_position = RotateHandVector(inverse_parent_q, offset);
+
+  XrPosef local{};
+  local.position = {local_position[0], local_position[1], local_position[2]};
+  local.orientation = MultiplyHandQuaternions(inverse_parent, global.orientation);
+  return local;
+}
+
+XrPosef ComposeRuntimeHandPose(const XrPosef& parent, const XrPosef& local)
+{
+  const std::array<float, 4> parent_q{parent.orientation.x, parent.orientation.y,
+                                      parent.orientation.z, parent.orientation.w};
+  const HandVec3 rotated_position =
+      RotateHandVector(parent_q, {local.position.x, local.position.y, local.position.z});
+
+  XrPosef result{};
+  result.position = {parent.position.x + rotated_position[0],
+                     parent.position.y + rotated_position[1],
+                     parent.position.z + rotated_position[2]};
+  result.orientation = MultiplyHandQuaternions(parent.orientation, local.orientation);
+  return result;
+}
+
+HandVec3 GetRuntimeHandBindPosition(const VR::TabletopHandMesh& mesh, XrHandJointEXT joint)
+{
+  const XrVector3f& position = mesh.joint_bind_poses[static_cast<size_t>(joint)].position;
+  return {position.x, position.y, position.z};
+}
+
+bool BuildGodotDrivenMetaHandPose(const VR::TabletopHandMesh& mesh, int hand, float index_amount,
+                                  float grip_amount, float thumb_amount,
+                                  std::vector<XrPosef>* posed)
+{
+  const size_t joint_count = mesh.joint_bind_poses.size();
+  if (joint_count < XR_HAND_JOINT_COUNT_EXT || mesh.joint_parents.size() < joint_count)
+    return false;
+
+  std::vector<XrPosef> local_poses(joint_count);
+  for (size_t joint = 0; joint < joint_count; ++joint)
+    local_poses[joint] = GetRuntimeHandLocalBindPose(mesh, joint);
+
+  index_amount = std::clamp(index_amount, 0.0f, 1.0f);
+  grip_amount = std::clamp(grip_amount, 0.0f, 1.0f);
+  thumb_amount = std::clamp(thumb_amount, 0.0f, 1.0f);
+
+  for (size_t track = 0; track < GODOT_HAND_TRACK_JOINTS.size(); ++track)
+  {
+    const size_t joint = static_cast<size_t>(GODOT_HAND_TRACK_JOINTS[track]);
+    if (joint >= local_poses.size())
+      return false;
+
+    float amount = grip_amount;
+    if (track <= 2)
+      amount = thumb_amount;
+    else if (track <= 6)
+      amount = index_amount;
+
+    const XrQuaternionf godot_open = GetGodotHandQuaternion(GODOT_RIGHT_OPEN[track], hand);
+    const XrQuaternionf godot_closed = GetGodotHandQuaternion(GODOT_RIGHT_CLOSED[track], hand);
+    const XrQuaternionf godot_delta =
+        MultiplyHandQuaternions(InverseHandQuaternion(godot_open), godot_closed);
+    const XrQuaternionf meta_closed =
+        MultiplyHandQuaternions(local_poses[joint].orientation, godot_delta);
+    local_poses[joint].orientation =
+        BlendHandQuaternion(local_poses[joint].orientation, meta_closed, amount);
+  }
+
+  posed->assign(joint_count, XrPosef{});
+  std::vector<bool> built(joint_count, false);
+  size_t built_count = 0;
+  for (size_t pass = 0; pass < joint_count && built_count < joint_count; ++pass)
+  {
+    bool made_progress = false;
+    for (size_t joint = 0; joint < joint_count; ++joint)
+    {
+      if (built[joint])
+        continue;
+
+      const int parent = static_cast<int>(mesh.joint_parents[joint]);
+      if (parent < 0 || static_cast<size_t>(parent) >= joint_count ||
+          static_cast<size_t>(parent) == joint)
+      {
+        (*posed)[joint] = local_poses[joint];
+      }
+      else
+      {
+        const size_t parent_index = static_cast<size_t>(parent);
+        if (!built[parent_index])
+          continue;
+        (*posed)[joint] = ComposeRuntimeHandPose((*posed)[parent_index], local_poses[joint]);
+      }
+
+      built[joint] = true;
+      ++built_count;
+      made_progress = true;
+    }
+
+    if (!made_progress)
+      break;
+  }
+
+  return built_count == joint_count;
+}
+
+bool RebuildRuntimeHandGlobalPose(const VR::TabletopHandMesh& mesh,
+                                  const std::vector<XrPosef>& local_poses,
+                                  std::vector<XrPosef>* global_poses)
+{
+  const size_t joint_count = local_poses.size();
+  if (joint_count == 0 || mesh.joint_parents.size() < joint_count)
+    return false;
+
+  global_poses->assign(joint_count, XrPosef{});
+  std::vector<bool> built(joint_count, false);
+  size_t built_count = 0;
+  for (size_t pass = 0; pass < joint_count && built_count < joint_count; ++pass)
+  {
+    bool made_progress = false;
+    for (size_t joint = 0; joint < joint_count; ++joint)
+    {
+      if (built[joint])
+        continue;
+
+      const int parent = static_cast<int>(mesh.joint_parents[joint]);
+      if (parent < 0 || static_cast<size_t>(parent) >= joint_count ||
+          static_cast<size_t>(parent) == joint)
+      {
+        (*global_poses)[joint] = local_poses[joint];
+      }
+      else
+      {
+        const size_t parent_index = static_cast<size_t>(parent);
+        if (!built[parent_index])
+          continue;
+        (*global_poses)[joint] =
+            ComposeRuntimeHandPose((*global_poses)[parent_index], local_poses[joint]);
+      }
+
+      built[joint] = true;
+      ++built_count;
+      made_progress = true;
+    }
+    if (!made_progress)
+      break;
+  }
+  return built_count == joint_count;
+}
+
+void ApplyValveLocalJointCurl(const VR::TabletopHandMesh& mesh, std::vector<XrPosef>* local_poses,
+                              XrHandJointEXT joint, XrHandJointEXT child,
+                              const HandVec3& flex_direction_global, float radians)
+{
+  const size_t joint_index = static_cast<size_t>(joint);
+  const size_t child_index = static_cast<size_t>(child);
+  if (joint_index >= local_poses->size() || child_index >= mesh.joint_bind_poses.size() ||
+      std::abs(radians) < 1.0e-5f)
+  {
+    return;
+  }
+
+  const HandVec3 joint_position = GetRuntimeHandBindPosition(mesh, joint);
+  const HandVec3 child_position = GetRuntimeHandBindPosition(mesh, child);
+  const HandVec3 finger_direction = HandNormalize(HandSub(child_position, joint_position));
+  const HandVec3 hinge_global = HandNormalize(HandCross(finger_direction, flex_direction_global));
+  if (HandDot(hinge_global, hinge_global) < 1.0e-8f)
+    return;
+
+  // Valve's sample stores each bone transform in its parent's space. Convert the anatomical hinge
+  // from Meta's bind/global hand space into this joint's local space, then post-multiply the bind
+  // local orientation. FK reconstruction moves every child joint along the resulting arc.
+  const XrQuaternionf inverse_joint_bind =
+      InverseHandQuaternion(mesh.joint_bind_poses[joint_index].orientation);
+  const std::array<float, 4> inverse_joint_q{inverse_joint_bind.x, inverse_joint_bind.y,
+                                             inverse_joint_bind.z, inverse_joint_bind.w};
+  const HandVec3 hinge_local = RotateHandVector(inverse_joint_q, hinge_global);
+  const XrQuaternionf bend = HandAxisAngle(hinge_local, radians);
+  (*local_poses)[joint_index].orientation =
+      MultiplyHandQuaternions((*local_poses)[joint_index].orientation, bend);
+}
+
+void ApplyValveFingerCurl(const VR::TabletopHandMesh& mesh, std::vector<XrPosef>* local_poses,
+                          const std::array<XrHandJointEXT, 5>& finger,
+                          const HandVec3& flex_direction, float amount)
+{
+  constexpr float DEG_TO_RAD = 0.01745329251994329577f;
+  amount = std::clamp(amount, 0.0f, 1.0f);
+  const std::array<float, 4> angles = {5.0f, 90.0f, 80.0f, 80.0f};
+  for (size_t i = 0; i < angles.size(); ++i)
+  {
+    ApplyValveLocalJointCurl(mesh, local_poses, finger[i], finger[i + 1], flex_direction,
+                             angles[i] * DEG_TO_RAD * amount);
+  }
+}
+
+HandVec3 ChooseValveFingerFlexDirection(const VR::TabletopHandMesh& mesh,
+                                        const std::array<XrHandJointEXT, 5>& finger,
+                                        const HandVec3& palm_normal)
+{
+  const HandVec3 palm = GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_PALM_EXT);
+  const auto score = [&](const HandVec3& direction) {
+    std::vector<XrPosef> local_poses(mesh.joint_bind_poses.size());
+    for (size_t joint = 0; joint < local_poses.size(); ++joint)
+      local_poses[joint] = GetRuntimeHandLocalBindPose(mesh, joint);
+
+    ApplyValveFingerCurl(mesh, &local_poses, finger, direction, 1.0f);
+    std::vector<XrPosef> global_poses;
+    if (!RebuildRuntimeHandGlobalPose(mesh, local_poses, &global_poses))
+      return std::numeric_limits<float>::max();
+
+    const XrVector3f& tip = global_poses[static_cast<size_t>(finger.back())].position;
+    const HandVec3 delta = HandSub({tip.x, tip.y, tip.z}, palm);
+    return HandDot(delta, delta);
+  };
+
+  const HandVec3 opposite = HandMul(palm_normal, -1.0f);
+  return score(palm_normal) <= score(opposite) ? palm_normal : opposite;
+}
+
+bool BuildValveDrivenMetaHandPose(const VR::TabletopHandMesh& mesh, float index_amount,
+                                  float grip_amount, float thumb_amount,
+                                  std::vector<XrPosef>* posed)
+{
+  const size_t joint_count = mesh.joint_bind_poses.size();
+  if (joint_count < XR_HAND_JOINT_COUNT_EXT || mesh.joint_parents.size() < joint_count)
+    return false;
+
+  std::vector<XrPosef> local_poses(joint_count);
+  for (size_t joint = 0; joint < joint_count; ++joint)
+    local_poses[joint] = GetRuntimeHandLocalBindPose(mesh, joint);
+
+  const HandVec3 across_palm = HandNormalize(HandSub(
+      GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_INDEX_PROXIMAL_EXT),
+      GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_LITTLE_PROXIMAL_EXT)));
+  const HandVec3 along_palm = HandNormalize(HandSub(
+      GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT),
+      GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_WRIST_EXT)));
+  const HandVec3 palm_normal = HandNormalize(HandCross(across_palm, along_palm));
+
+  const std::array<XrHandJointEXT, 5> index = {
+      XR_HAND_JOINT_INDEX_METACARPAL_EXT, XR_HAND_JOINT_INDEX_PROXIMAL_EXT,
+      XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT, XR_HAND_JOINT_INDEX_DISTAL_EXT,
+      XR_HAND_JOINT_INDEX_TIP_EXT};
+  const std::array<XrHandJointEXT, 5> middle = {
+      XR_HAND_JOINT_MIDDLE_METACARPAL_EXT, XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT,
+      XR_HAND_JOINT_MIDDLE_INTERMEDIATE_EXT, XR_HAND_JOINT_MIDDLE_DISTAL_EXT,
+      XR_HAND_JOINT_MIDDLE_TIP_EXT};
+  const std::array<XrHandJointEXT, 5> ring = {
+      XR_HAND_JOINT_RING_METACARPAL_EXT, XR_HAND_JOINT_RING_PROXIMAL_EXT,
+      XR_HAND_JOINT_RING_INTERMEDIATE_EXT, XR_HAND_JOINT_RING_DISTAL_EXT,
+      XR_HAND_JOINT_RING_TIP_EXT};
+  const std::array<XrHandJointEXT, 5> little = {
+      XR_HAND_JOINT_LITTLE_METACARPAL_EXT, XR_HAND_JOINT_LITTLE_PROXIMAL_EXT,
+      XR_HAND_JOINT_LITTLE_INTERMEDIATE_EXT, XR_HAND_JOINT_LITTLE_DISTAL_EXT,
+      XR_HAND_JOINT_LITTLE_TIP_EXT};
+
+  ApplyValveFingerCurl(mesh, &local_poses, index,
+                       HandMul(ChooseValveFingerFlexDirection(mesh, index, palm_normal), -1.0f),
+                       index_amount);
+  ApplyValveFingerCurl(mesh, &local_poses, middle,
+                       ChooseValveFingerFlexDirection(mesh, middle, palm_normal), grip_amount);
+  ApplyValveFingerCurl(mesh, &local_poses, ring,
+                       ChooseValveFingerFlexDirection(mesh, ring, palm_normal), grip_amount);
+  ApplyValveFingerCurl(mesh, &local_poses, little,
+                       HandMul(ChooseValveFingerFlexDirection(mesh, little, palm_normal), -1.0f),
+                       grip_amount);
+
+  // Keep the thumb conservative because its previous controller pose was already visually good.
+  // Use the same local-parent FK mechanism, but with smaller bends than Valve's empty-hand sample.
+  const HandVec3 thumb_target =
+      GetRuntimeHandBindPosition(mesh, XR_HAND_JOINT_INDEX_PROXIMAL_EXT);
+  const std::array<XrHandJointEXT, 4> thumb = {
+      XR_HAND_JOINT_THUMB_METACARPAL_EXT, XR_HAND_JOINT_THUMB_PROXIMAL_EXT,
+      XR_HAND_JOINT_THUMB_DISTAL_EXT, XR_HAND_JOINT_THUMB_TIP_EXT};
+  constexpr float DEG_TO_RAD = 0.01745329251994329577f;
+  const std::array<float, 3> thumb_angles = {5.0f, 40.0f, 35.0f};
+  for (size_t i = 0; i < thumb_angles.size(); ++i)
+  {
+    const HandVec3 root = GetRuntimeHandBindPosition(mesh, thumb[i]);
+    const HandVec3 flex_direction = HandNormalize(HandSub(thumb_target, root));
+    ApplyValveLocalJointCurl(mesh, &local_poses, thumb[i], thumb[i + 1], flex_direction,
+                             thumb_angles[i] * DEG_TO_RAD * std::clamp(thumb_amount, 0.0f, 1.0f));
+  }
+
+  return RebuildRuntimeHandGlobalPose(mesh, local_poses, posed);
+}
+
+bool BuildTouchDrivenRuntimeHandJoints(
+    const VR::TabletopHandMesh& mesh, const Common::VR::OpenXRControllerState& controller, int hand,
+    std::array<Common::VR::OpenXRPoseState, XR_HAND_JOINT_COUNT_EXT>* out_joints)
+{
+  if (mesh.joint_bind_poses.size() < XR_HAND_JOINT_COUNT_EXT ||
+      mesh.joint_parents.size() < XR_HAND_JOINT_COUNT_EXT)
+  {
+    return false;
+  }
+
+  const Common::VR::OpenXRPoseState* controller_pose =
+      controller.grip_pose.valid ? &controller.grip_pose :
+      controller.aim_pose.valid  ? &controller.aim_pose : nullptr;
+  if (!controller_pose)
+    return false;
+
+  // Use Valve's official hand-skeleton simulation model for controller-driven curls: each joint
+  // rotates in its local/parent space, and the full Meta hierarchy is rebuilt with FK. This keeps
+  // the Meta mesh/lengths while avoiding the cross-skeleton quaternion retargeting that made the
+  // last Godot-based attempt rotate fingers almost in place.
+  const float index_curl =
+      std::clamp(std::max(controller.hand_trigger_value, controller.trigger_button ? 1.0f : 0.0f),
+                 0.0f, 1.0f);
+  const float grip_curl =
+      std::clamp(std::max(controller.hand_squeeze_value, controller.squeeze_button ? 1.0f : 0.0f),
+                 0.0f, 1.0f);
+  const float thumb_curl =
+      std::clamp(std::max(grip_curl * 0.16f, controller.hand_thumb_pressed ? 0.58f : 0.0f), 0.0f,
+                 1.0f);
+
+  std::vector<XrPosef> posed;
+  if (!BuildValveDrivenMetaHandPose(mesh, index_curl, grip_curl, thumb_curl, &posed))
+    return false;
+
+  // If simultaneous optical tracking has ever been available, OpenXRManager gives us the measured
+  // Touch-grip -> wrist transform. Otherwise use the grip pose as the PALM pose, which matches the
+  // OpenXR grip-pose semantics much better than pretending the controller origin is the wrist.
+  // This removes the large rotation/translation error seen with the previous hard-coded offset.
+  const bool use_measured_wrist =
+      controller.hand_wrist_from_grip_valid && controller.grip_pose.valid;
+  const XrPosef& bind_reference =
+      mesh.joint_bind_poses[use_measured_wrist ? XR_HAND_JOINT_WRIST_EXT : XR_HAND_JOINT_PALM_EXT];
+  const XrQuaternionf inverse_bind_reference =
+      {-bind_reference.orientation.x, -bind_reference.orientation.y, -bind_reference.orientation.z,
+       bind_reference.orientation.w};
+
+  std::array<float, 3> room_reference_position = controller_pose->position;
+  std::array<float, 4> room_reference_orientation = controller_pose->orientation;
+  if (!use_measured_wrist)
+  {
+    // Match Godot XR Tools' Meta Touch grip-to-palm orientation: Touch/Touch Plus use a -60 degree
+    // X-axis grip rotation. Their palm offset does not add a separate left/right roll, so keep the
+    // fallback symmetrical and let the runtime controller pose provide the hand-specific cant.
+    constexpr float DEG_TO_RAD = 0.01745329251994329577f;
+    const XrQuaternionf controller_orientation{room_reference_orientation[0],
+                                                room_reference_orientation[1],
+                                                room_reference_orientation[2],
+                                                room_reference_orientation[3]};
+    const XrQuaternionf wrist_tilt =
+        HandAxisAngle({1.0f, 0.0f, 0.0f}, -60.0f * DEG_TO_RAD);
+    const XrQuaternionf tilted_orientation =
+        MultiplyHandQuaternions(controller_orientation, wrist_tilt);
+    room_reference_orientation = {tilted_orientation.x, tilted_orientation.y,
+                                  tilted_orientation.z, tilted_orientation.w};
+  }
+  else
+  {
+    const auto& calibration = controller.hand_wrist_from_grip;
+    room_reference_position =
+        TransformHandPoint(controller.grip_pose.orientation, controller.grip_pose.position,
+                           calibration.position);
+    const XrQuaternionf grip_orientation{
+        controller.grip_pose.orientation[0], controller.grip_pose.orientation[1],
+        controller.grip_pose.orientation[2], controller.grip_pose.orientation[3]};
+    const XrQuaternionf calibration_orientation{
+        calibration.orientation[0], calibration.orientation[1], calibration.orientation[2],
+        calibration.orientation[3]};
+    const XrQuaternionf wrist_orientation =
+        MultiplyHandQuaternions(grip_orientation, calibration_orientation);
+    room_reference_orientation = {wrist_orientation.x, wrist_orientation.y, wrist_orientation.z,
+                                  wrist_orientation.w};
+  }
+  const XrQuaternionf room_reference_q{room_reference_orientation[0],
+                                        room_reference_orientation[1],
+                                        room_reference_orientation[2],
+                                        room_reference_orientation[3]};
+
+  for (size_t joint = 0; joint < out_joints->size(); ++joint)
+  {
+    const XrPosef& src = posed[joint];
+    const HandVec3 reference_local = InverseTransformHandPoint(
+        bind_reference, {src.position.x, src.position.y, src.position.z});
+
+    auto& dst = (*out_joints)[joint];
+    dst.valid = true;
+    dst.position = TransformHandPoint(room_reference_orientation, room_reference_position,
+                                      reference_local);
+    const XrQuaternionf relative_orientation =
+        MultiplyHandQuaternions(inverse_bind_reference, src.orientation);
+    const XrQuaternionf room_orientation =
+        MultiplyHandQuaternions(room_reference_q, relative_orientation);
+    dst.orientation = {room_orientation.x, room_orientation.y, room_orientation.z,
+                       room_orientation.w};
+  }
+  return true;
+}
+
 bool BuildRuntimeControllerHand(const VR::TabletopHandMesh& mesh,
                                 const Common::VR::OpenXRControllerState& controller, int hand,
                                 std::vector<HandRoomVertex>* room_vertices)
 {
-  // Use the runtime mesh only when optical joints are actually available. If Quest hand tracking
-  // is disabled (or temporarily unavailable while the user is holding Touch controllers), fall
-  // through to BuildControllerHand below: that fallback animates index/grip/thumb from controller
-  // inputs instead of showing a rigid bind-pose hand.
-  if (!mesh.valid || mesh.vertex_positions.empty() || mesh.indices.size() < 3 ||
-      !controller.hand_joints_valid)
-  {
+  if (!mesh.valid || mesh.vertex_positions.empty() || mesh.indices.size() < 3)
     return false;
+
+  // Hybrid mode: real optical OpenXR hand tracking wins whenever the runtime reports a valid
+  // skeleton. If hand tracking is inactive, fall back immediately to the controller-driven
+  // Valve/FK pose used by Touch trigger/grip. This restores the older tracked-hand behavior
+  // without sacrificing the current controller animation when no hand is detected.
+  const std::array<Common::VR::OpenXRPoseState, XR_HAND_JOINT_COUNT_EXT>* joints =
+      &controller.hand_joints;
+  std::array<Common::VR::OpenXRPoseState, XR_HAND_JOINT_COUNT_EXT> touch_joints{};
+  if (!controller.hand_joints_valid)
+  {
+    if (!BuildTouchDrivenRuntimeHandJoints(mesh, controller, hand, &touch_joints))
+      return false;
+    joints = &touch_joints;
   }
-  (void)hand;
 
   constexpr u32 SKIN = 0xFFFFFFFF;
   std::vector<HandVec3> skinned(mesh.vertex_positions.size());
-  bool used_live_skeleton = true;
-
-  if (used_live_skeleton)
+  for (size_t vertex_index = 0; vertex_index < mesh.vertex_positions.size(); ++vertex_index)
   {
-    for (size_t vertex_index = 0; vertex_index < mesh.vertex_positions.size(); ++vertex_index)
+    const XrVector3f& src = mesh.vertex_positions[vertex_index];
+    const HandVec3 bind_vertex{src.x, src.y, src.z};
+    const XrVector4sFB& blend_indices = mesh.vertex_blend_indices[vertex_index];
+    const XrVector4f& blend_weights = mesh.vertex_blend_weights[vertex_index];
+    const std::array<int16_t, 4> indices = {blend_indices.x, blend_indices.y, blend_indices.z,
+                                             blend_indices.w};
+    const std::array<float, 4> weights = {blend_weights.x, blend_weights.y, blend_weights.z,
+                                           blend_weights.w};
+
+    HandVec3 blended{0.0f, 0.0f, 0.0f};
+    float total_weight = 0.0f;
+    for (size_t influence = 0; influence < 4; ++influence)
     {
-      const XrVector3f& src = mesh.vertex_positions[vertex_index];
-      const HandVec3 bind_vertex{src.x, src.y, src.z};
-      const XrVector4sFB& blend_indices = mesh.vertex_blend_indices[vertex_index];
-      const XrVector4f& blend_weights = mesh.vertex_blend_weights[vertex_index];
-      const std::array<int16_t, 4> indices = {blend_indices.x, blend_indices.y, blend_indices.z,
-                                               blend_indices.w};
-      const std::array<float, 4> weights = {blend_weights.x, blend_weights.y, blend_weights.z,
-                                             blend_weights.w};
-
-      HandVec3 blended{0.0f, 0.0f, 0.0f};
-      float total_weight = 0.0f;
-      for (size_t influence = 0; influence < 4; ++influence)
+      const int joint = indices[influence];
+      const float weight = weights[influence];
+      if (weight <= 0.0001f || joint < 0 ||
+          static_cast<size_t>(joint) >= mesh.joint_bind_poses.size() ||
+          static_cast<size_t>(joint) >= joints->size() || !(*joints)[joint].valid)
       {
-        const int joint = indices[influence];
-        const float weight = weights[influence];
-        if (weight <= 0.0001f || joint < 0 ||
-            static_cast<size_t>(joint) >= mesh.joint_bind_poses.size() ||
-            static_cast<size_t>(joint) >= controller.hand_joints.size() ||
-            !controller.hand_joints[joint].valid)
-        {
-          continue;
-        }
-
-        const HandVec3 joint_local =
-            InverseTransformHandPoint(mesh.joint_bind_poses[joint], bind_vertex);
-        const auto& current_joint = controller.hand_joints[joint];
-        const HandVec3 posed = TransformHandPoint(current_joint.orientation,
-                                                  current_joint.position, joint_local);
-        blended = HandAdd(blended, HandMul(posed, weight));
-        total_weight += weight;
+        continue;
       }
 
-      if (total_weight > 0.001f)
-      {
-        skinned[vertex_index] = HandMul(blended, 1.0f / total_weight);
-      }
-      else
-      {
-        used_live_skeleton = false;
-        break;
-      }
+      const HandVec3 joint_local =
+          InverseTransformHandPoint(mesh.joint_bind_poses[joint], bind_vertex);
+      const auto& current_joint = (*joints)[joint];
+      const HandVec3 vertex =
+          TransformHandPoint(current_joint.orientation, current_joint.position, joint_local);
+      blended = HandAdd(blended, HandMul(vertex, weight));
+      total_weight += weight;
     }
-  }
 
-  if (!used_live_skeleton)
-    return false;
+    if (total_weight <= 0.001f)
+      return false;
+    skinned[vertex_index] = HandMul(blended, 1.0f / total_weight);
+  }
 
   const size_t before = room_vertices->size();
   room_vertices->reserve(before + mesh.indices.size());
@@ -360,87 +853,6 @@ bool BuildRuntimeControllerHand(const VR::TabletopHandMesh& mesh,
   }
 
   return room_vertices->size() > before;
-}
-
-void BuildControllerHand(const Common::VR::OpenXRControllerState& controller, int hand,
-                         std::vector<HandRoomVertex>* room_vertices)
-{
-  if (!controller.connected || !controller.grip_pose.valid)
-    return;
-
-  // Full white fallback to match the runtime hand mesh styling used by tabletop mode.
-  constexpr u32 SKIN = 0xFFFFFFFF;
-  const float mirror = hand == 0 ? -1.0f : 1.0f;
-
-  std::vector<HandRoomVertex> local;
-  local.reserve(700);
-
-  // Palm and short wrist. Grip pose sits near the controller handle, so the palm is offset a
-  // little down/back from it to make the virtual hand wrap the Touch controller naturally.
-  AppendHandBox(&local, {0.0f, -0.018f, 0.012f}, {0.043f, 0.016f, 0.050f}, SKIN);
-  AppendHandBox(&local, {0.0f, -0.020f, 0.080f}, {0.032f, 0.014f, 0.024f}, SKIN);
-
-  const float index_curl = std::clamp(controller.hand_trigger_value, 0.0f, 1.0f);
-  const float grip_curl = std::clamp(controller.hand_squeeze_value, 0.0f, 1.0f);
-  const float thumb_curl = controller.hand_thumb_pressed ? 0.72f : 0.18f + grip_curl * 0.22f;
-
-  struct FingerSpec
-  {
-    float x;
-    std::array<float, 3> lengths;
-    float width;
-    float spread;
-    float curl;
-  };
-  const std::array<FingerSpec, 4> fingers = {
-      FingerSpec{0.027f, {0.039f, 0.027f, 0.020f}, 0.017f, 0.035f, index_curl},
-      FingerSpec{0.009f, {0.043f, 0.030f, 0.022f}, 0.018f, 0.010f, grip_curl},
-      FingerSpec{-0.010f, {0.040f, 0.028f, 0.020f}, 0.017f, -0.010f, grip_curl},
-      FingerSpec{-0.029f, {0.033f, 0.023f, 0.017f}, 0.014f, -0.045f, grip_curl}};
-
-  for (const FingerSpec& finger : fingers)
-  {
-    HandVec3 p{finger.x, -0.010f, -0.036f};
-    float bend = 0.08f * finger.curl;
-    for (size_t joint = 0; joint < finger.lengths.size(); ++joint)
-    {
-      bend += finger.curl * (joint == 0 ? 0.62f : joint == 1 ? 0.78f : 0.64f);
-      const float spread_x = std::sin(finger.spread);
-      const float forward_scale = std::cos(finger.spread);
-      const HandVec3 dir = HandNormalize(
-          {spread_x, -std::sin(bend) * forward_scale, -std::cos(bend) * forward_scale});
-      const HandVec3 next = HandAdd(p, HandMul(dir, finger.lengths[joint]));
-      const float taper = 1.0f - static_cast<float>(joint) * 0.14f;
-      AppendHandSegment(&local, p, next, finger.width * taper, 0.014f * taper, SKIN);
-      p = next;
-    }
-  }
-
-  // Thumb: angled out of the palm, with two curl stages tied to face-button/thumbstick use.
-  HandVec3 thumb_p{0.042f, -0.010f, 0.012f};
-  float thumb_bend = 0.15f + thumb_curl * 0.35f;
-  const std::array<float, 3> thumb_lengths{0.033f, 0.026f, 0.020f};
-  for (size_t joint = 0; joint < thumb_lengths.size(); ++joint)
-  {
-    thumb_bend += thumb_curl * (joint == 0 ? 0.42f : 0.52f);
-    const HandVec3 dir = HandNormalize(
-        {0.70f - 0.12f * thumb_curl, -0.25f - std::sin(thumb_bend) * 0.35f,
-         -0.62f - std::cos(thumb_bend) * 0.18f});
-    const HandVec3 next = HandAdd(thumb_p, HandMul(dir, thumb_lengths[joint]));
-    AppendHandSegment(&local, thumb_p, next, 0.018f - static_cast<float>(joint) * 0.0025f,
-                      0.015f - static_cast<float>(joint) * 0.0020f, SKIN);
-    thumb_p = next;
-  }
-
-  for (HandRoomVertex vertex : local)
-  {
-    vertex.position[0] *= mirror;
-    vertex.position = RotateHandVector(controller.grip_pose.orientation, vertex.position);
-    vertex.position[0] += controller.grip_pose.position[0];
-    vertex.position[1] += controller.grip_pose.position[1];
-    vertex.position[2] += controller.grip_pose.position[2];
-    room_vertices->push_back(vertex);
-  }
 }
 
 bool ProjectHandPointToEye(const VR::XREyeView& eye, const HandVec3& room_point,
@@ -1475,12 +1887,10 @@ void Presenter::DrawTabletopHands(AbstractFramebuffer* framebuffer, uint32_t eye
   room_vertices.reserve(12000);
   for (int hand = 0; hand < 2; ++hand)
   {
+    const auto& controller = input.controllers[hand];
     const VR::TabletopHandMesh* runtime_mesh = VR::g_openxr->GetTabletopHandMesh(hand);
-    if (!runtime_mesh ||
-        !BuildRuntimeControllerHand(*runtime_mesh, input.controllers[hand], hand, &room_vertices))
-    {
-      BuildControllerHand(input.controllers[hand], hand, &room_vertices);
-    }
+    if (runtime_mesh)
+      BuildRuntimeControllerHand(*runtime_mesh, controller, hand, &room_vertices);
   }
   if (room_vertices.empty())
     return;
