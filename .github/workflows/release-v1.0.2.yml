@@ -1,0 +1,67 @@
+name: Publish v1.0.2 release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event.head_commit.message == 'Publish v1.0.2 release automation'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout v1.0.2
+        uses: actions/checkout@v4
+        with:
+          ref: v1.0.2
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build components
+        shell: pwsh
+        run: |
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Build Quest release APK
+        shell: pwsh
+        run: |
+          ./scripts/build-quest.ps1 -Configuration ReleaseNoMinify
+          Copy-Item -Force ./dist/AnimalCrossingVR-Quest3.apk ./dist/AnimalCrossingVR-Quest3-v1.0.2.apk
+          Get-FileHash -Algorithm SHA256 ./dist/AnimalCrossingVR-Quest3-v1.0.2.apk
+
+      - name: Create GitHub release and upload APK
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          Animal Crossing VR/MR Standalone v1.0.2
+
+          Highlights:
+          - Fixes the train-to-town transition crash by removing the unsafe REL actor-culling patch.
+          - Improves tabletop camera stability across scene and VR-camera transitions.
+          - Improves tabletop UI placement and interaction alignment.
+          - Adds Quest Touch Plus/OpenXR input handling improvements.
+          - Uses the Meta/OpenXR runtime hand mesh.
+          - Adds hybrid hand rendering: live OpenXR hand tracking when valid, with Valve-style controller-driven FK fallback otherwise.
+          - Keeps the validated tabletop/VR runtime camera toggle and passthrough behavior.
+          "@
+
+          gh release create v1.0.2 ./dist/AnimalCrossingVR-Quest3-v1.0.2.apk `
+            --repo heurazy/AnimalCrossing-VR-MR-Standalone `
+            --title "Animal Crossing VR/MR Standalone v1.0.2" `
+            --notes $notes `
+            --verify-tag
